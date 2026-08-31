@@ -12,11 +12,14 @@
 #define ROUTE_DEADLINE_MSEC 5000
 #define ROUTE_PROCESS_TIMEOUT_MSEC 750
 #define ROUTE_SECOND_INPUT_PASS_MSEC 150
+#define ROUTE_TRANSPORT_RESTART_MSEC 200
 
 typedef enum {
     ROUTE_OPERATION_FIND_SINK,
     ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT,
     ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT,
+    ROUTE_OPERATION_SUSPEND_SINK,
+    ROUTE_OPERATION_RESUME_SINK,
     ROUTE_OPERATION_SET_DEFAULT,
     ROUTE_OPERATION_LIST_INPUTS,
     ROUTE_OPERATION_MOVE_INPUT,
@@ -50,9 +53,11 @@ struct AudioRoute {
     guint generation;
     guint retry_timeout_id;
     guint second_input_pass_timeout_id;
+    guint resume_sink_timeout_id;
     gint64 deadline_usec;
     gchar *device_address;
     gchar *second_input_pass_sink;
+    gchar *resume_sink;
     GCancellable *cancellable;
     RouteMode mode;
 
@@ -85,6 +90,7 @@ static void audio_route_unref(AudioRoute *route)
     g_clear_object(&route->cancellable);
     g_clear_pointer(&route->device_address, g_free);
     g_clear_pointer(&route->second_input_pass_sink, g_free);
+    g_clear_pointer(&route->resume_sink, g_free);
     g_clear_pointer(&route->previous_default_sink, g_free);
     g_clear_pointer(&route->managed_sink, g_free);
     g_clear_pointer(&route->restore_sink, g_free);
@@ -540,6 +546,7 @@ static gboolean route_is_current(RouteOperation *operation)
 static void route_schedule_retry(AudioRoute *route);
 static void route_query_sink(AudioRoute *route);
 static void route_list_inputs(AudioRoute *route, const gchar *sink_name);
+static void route_set_default(AudioRoute *route, const gchar *sink_name);
 static void restore_query_configured(AudioRoute *route,
                                      RouteOperationType type);
 
@@ -661,6 +668,59 @@ static void route_schedule_second_input_pass(AudioRoute *route,
         route_second_input_pass_cb,
         audio_route_ref(route),
         (GDestroyNotify)audio_route_unref);
+}
+
+static gboolean route_resume_sink_cb(gpointer user_data)
+{
+    AudioRoute *route = user_data;
+    route->resume_sink_timeout_id = 0;
+
+    if (route->mode == ROUTE_MODE_SELECTING &&
+        route->cancellable != NULL &&
+        !g_cancellable_is_cancelled(route->cancellable) &&
+        route->resume_sink != NULL) {
+        const gchar *argv[] = {
+            "pactl", "suspend-sink", route->resume_sink, "0", NULL
+        };
+        if (!route_spawn(route,
+                         ROUTE_OPERATION_RESUME_SINK,
+                         argv,
+                         route->resume_sink)) {
+            route_set_default(route, route->resume_sink);
+        }
+    }
+
+    g_clear_pointer(&route->resume_sink, g_free);
+    return G_SOURCE_REMOVE;
+}
+
+static void route_schedule_sink_resume(AudioRoute *route,
+                                       const gchar *sink_name)
+{
+    if (route->resume_sink_timeout_id > 0)
+        g_source_remove(route->resume_sink_timeout_id);
+
+    g_free(route->resume_sink);
+    route->resume_sink = g_strdup(sink_name);
+    route->resume_sink_timeout_id = g_timeout_add_full(
+        G_PRIORITY_DEFAULT,
+        ROUTE_TRANSPORT_RESTART_MSEC,
+        route_resume_sink_cb,
+        audio_route_ref(route),
+        (GDestroyNotify)audio_route_unref);
+}
+
+static void route_restart_sink(AudioRoute *route, const gchar *sink_name)
+{
+    const gchar *argv[] = {
+        "pactl", "suspend-sink", sink_name, "1", NULL
+    };
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_SUSPEND_SINK,
+                     argv,
+                     sink_name)) {
+        route_set_default(route, sink_name);
+    }
 }
 
 static void route_set_default(AudioRoute *route, const gchar *sink_name)
@@ -842,9 +902,19 @@ static void route_operation_finished(GObject *source_object,
                 route->previous_default_sink = g_steal_pointer(&configured);
             }
             g_free(configured);
-            route_set_default(route, operation->sink_name);
+            /* Restart the A2DP transport after an Apple host yielded it.
+             * Selecting and moving streams alone does not reliably reopen
+             * the transport on BlueZ/PipeWire. Keep the proven delay off the
+             * GLib main thread so wear and handoff packets remain responsive. */
+            route_restart_sink(route, operation->sink_name);
             break;
         }
+        case ROUTE_OPERATION_SUSPEND_SINK:
+            route_schedule_sink_resume(route, operation->sink_name);
+            break;
+        case ROUTE_OPERATION_RESUME_SINK:
+            route_set_default(route, operation->sink_name);
+            break;
         case ROUTE_OPERATION_SET_DEFAULT:
             g_message("Selected AirPods as the default audio output");
             route->mode = ROUTE_MODE_IDLE;
@@ -917,9 +987,15 @@ static void route_operation_finished(GObject *source_object,
         switch (operation->type) {
         case ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT:
             if (route->previous_default_sink != NULL)
-                route_set_default(route, operation->sink_name);
+                route_restart_sink(route, operation->sink_name);
             else
                 route_schedule_retry(route);
+            break;
+        case ROUTE_OPERATION_SUSPEND_SINK:
+        case ROUTE_OPERATION_RESUME_SINK:
+            /* Routing is still useful if PipeWire rejects an explicit
+             * suspend/resume (for example while the transport is changing). */
+            route_set_default(route, operation->sink_name);
             break;
         case ROUTE_OPERATION_FIND_SINK:
         case ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT:
@@ -1026,6 +1102,10 @@ void audio_route_cancel(AudioRoute *route)
         g_source_remove(route->second_input_pass_timeout_id);
         route->second_input_pass_timeout_id = 0;
     }
+    if (route->resume_sink_timeout_id > 0) {
+        g_source_remove(route->resume_sink_timeout_id);
+        route->resume_sink_timeout_id = 0;
+    }
 
     if (route->cancellable != NULL)
         g_cancellable_cancel(route->cancellable);
@@ -1039,6 +1119,7 @@ void audio_route_cancel(AudioRoute *route)
     g_clear_object(&route->cancellable);
     g_clear_pointer(&route->device_address, g_free);
     g_clear_pointer(&route->second_input_pass_sink, g_free);
+    g_clear_pointer(&route->resume_sink, g_free);
     g_clear_pointer(&route->restore_sink, g_free);
     g_clear_pointer(&route->restore_managed_index, g_free);
     route->deadline_usec = 0;

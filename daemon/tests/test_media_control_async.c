@@ -405,6 +405,47 @@ static void test_unconfirmed_source_initial_out_keeps_speakers_playing(void)
     g_object_unref(test_bus);
 }
 
+static void test_second_player_start_is_forwarded_while_first_is_playing(void)
+{
+    GTestDBus *test_bus = g_test_dbus_new(G_TEST_DBUS_NONE);
+    g_test_dbus_up(test_bus);
+
+    MediaControl *mc = media_control_new();
+    g_assert_nonnull(mc);
+
+    FakePlayerService first = {0};
+    FakePlayerService second = {0};
+    fake_player_service_start(&first,
+                              test_bus,
+                              TEST_PLAYER_ONE_NAME,
+                              "Playing");
+    fake_player_service_start(&second,
+                              test_bus,
+                              TEST_PLAYER_TWO_NAME,
+                              "Paused");
+    PlayerPair pair = {&first.player, &second.player};
+    g_assert_true(spin_until(both_players_were_queried, &pair, 2000));
+    g_assert_true(spin_until(media_is_playing, mc, 2000));
+
+    guint playback_started_count = 0;
+    media_control_set_playback_started_callback(mc,
+                                                count_playback_started,
+                                                &playback_started_count);
+    fake_player_emit_status(&second.player, "Playing");
+    drain_main_context();
+
+    /* The aggregate remains Playing, but this explicit edge must still reach
+     * handoff policy so Linux can reclaim AirPods from another host. */
+    g_assert_cmpuint(playback_started_count, ==, 1);
+
+    media_control_free(mc);
+    drain_main_context();
+    fake_player_service_stop(&first);
+    fake_player_service_stop(&second);
+    g_test_dbus_down(test_bus);
+    g_object_unref(test_bus);
+}
+
 static void test_disconnected_restart_reconciles_only_that_player(void)
 {
     GTestDBus *test_bus = g_test_dbus_new(G_TEST_DBUS_NONE);
@@ -705,6 +746,8 @@ int main(int argc, char **argv)
                     test_explicit_start_is_not_repaused_off_head);
     g_test_add_func("/media-control/unconfirmed-source-keeps-speakers",
                     test_unconfirmed_source_initial_out_keeps_speakers_playing);
+    g_test_add_func("/media-control/second-player-start-forwarded",
+                    test_second_player_start_is_forwarded_while_first_is_playing);
     g_test_add_func("/media-control/disconnected-restart-is-player-local",
                     test_disconnected_restart_reconciles_only_that_player);
     g_test_add_func("/media-control/handoff-restart-is-player-local",

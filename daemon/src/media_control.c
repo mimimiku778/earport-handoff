@@ -153,10 +153,13 @@ static void handle_playback_update(MediaControl *mc,
     if (player_started)
         reconcile_explicit_player_start(mc, player_name);
 
-    if (transition == MEDIA_PLAYBACK_TRANSITION_STARTED) {
+    if (transition == MEDIA_PLAYBACK_TRANSITION_STARTED || player_started) {
         /* Ear removal is an edge-triggered pause. A later explicit MPRIS
          * start is allowed to continue on speakers; claim/reroute policy in
-         * main independently fails closed while wear is unknown or blocked. */
+         * main independently fails closed while wear is unknown or blocked.
+         * Forward every real per-player Playing edge, not just the aggregate
+         * zero-to-one edge: another MPRIS player can remain logically Playing
+         * while an iPhone owns the AirPods. */
         if (mc->playback_started_callback != NULL) {
             MediaPlaybackStartedCallback callback =
                 mc->playback_started_callback;
