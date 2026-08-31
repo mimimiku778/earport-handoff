@@ -15,6 +15,7 @@
 #define ROUTE_TRANSPORT_RESTART_MSEC 200
 
 typedef enum {
+    ROUTE_OPERATION_SET_A2DP_PROFILE,
     ROUTE_OPERATION_FIND_SINK,
     ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT,
     ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT,
@@ -544,6 +545,7 @@ static gboolean route_is_current(RouteOperation *operation)
 }
 
 static void route_schedule_retry(AudioRoute *route);
+static void route_select_media_profile(AudioRoute *route);
 static void route_query_sink(AudioRoute *route);
 static void route_list_inputs(AudioRoute *route, const gchar *sink_name);
 static void route_set_default(AudioRoute *route, const gchar *sink_name);
@@ -723,6 +725,31 @@ static void route_restart_sink(AudioRoute *route, const gchar *sink_name)
     }
 }
 
+static void route_select_media_profile(AudioRoute *route)
+{
+    if (route == NULL || !valid_device_address(route->device_address)) {
+        return;
+    }
+
+    gchar *address_token = g_ascii_strup(route->device_address, -1);
+    for (gchar *p = address_token; *p != '\0'; p++) {
+        if (*p == ':')
+            *p = '_';
+    }
+    gchar *card_name = g_strdup_printf("bluez_card.%s", address_token);
+    const gchar *argv[] = {
+        "pactl", "set-card-profile", card_name, "a2dp-sink", NULL
+    };
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_SET_A2DP_PROFILE,
+                     argv,
+                     NULL)) {
+        route_query_sink(route);
+    }
+    g_free(card_name);
+    g_free(address_token);
+}
+
 static void route_set_default(AudioRoute *route, const gchar *sink_name)
 {
     g_free(route->managed_sink);
@@ -868,6 +895,9 @@ static void route_operation_finished(GObject *source_object,
 
     if (current && successful) {
         switch (operation->type) {
+        case ROUTE_OPERATION_SET_A2DP_PROFILE:
+            route_query_sink(route);
+            break;
         case ROUTE_OPERATION_FIND_SINK: {
             gchar *sink_name = find_sink_for_address(standard_output,
                                                      route->device_address);
@@ -985,6 +1015,11 @@ static void route_operation_finished(GObject *source_object,
         }
     } else if (current) {
         switch (operation->type) {
+        case ROUTE_OPERATION_SET_A2DP_PROFILE:
+            /* A2DP may already be active or the card may still be appearing.
+             * Continue with bounded sink discovery either way. */
+            route_query_sink(route);
+            break;
         case ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT:
             if (route->previous_default_sink != NULL)
                 route_restart_sink(route, operation->sink_name);
@@ -1137,7 +1172,10 @@ gboolean audio_route_start(AudioRoute *route, const char *device_address)
     route->mode = ROUTE_MODE_SELECTING;
     route->deadline_usec = g_get_monotonic_time() +
                            ROUTE_DEADLINE_MSEC * G_TIME_SPAN_MILLISECOND;
-    route_query_sink(route);
+    /* A normal media claim must never inherit an HFP/HSP card profile left
+     * behind by a transient capture stream. Calls can still select HFP while
+     * no media claim is in progress. */
+    route_select_media_profile(route);
     return TRUE;
 }
 
