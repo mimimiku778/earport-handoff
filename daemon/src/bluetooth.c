@@ -32,6 +32,29 @@ struct BluetoothConnection {
     uint8_t recv_buffer[BT_MAX_PACKET_SIZE];
 };
 
+bool bt_connection_get_local_audio_source_address(BluetoothConnection *conn,
+                                                  uint8_t address[6])
+{
+    if (conn == NULL || address == NULL || conn->socket_fd < 0)
+        return false;
+
+    /* Use the adapter selected by the kernel for this exact L2CAP socket.
+     * hci_get_route(NULL) may select a different adapter on multi-adapter
+     * systems and make our own AudioSource notification look remote. */
+    struct sockaddr_l2 local_addr;
+    socklen_t local_addr_len = sizeof(local_addr);
+    memset(&local_addr, 0, sizeof(local_addr));
+    if (getsockname(conn->socket_fd,
+                    (struct sockaddr *)&local_addr,
+                    &local_addr_len) < 0) {
+        g_warning("Could not read the L2CAP adapter address: %s", strerror(errno));
+        return false;
+    }
+
+    memcpy(address, local_addr.l2_bdaddr.b, sizeof(local_addr.l2_bdaddr.b));
+    return true;
+}
+
 BluetoothConnection *bt_connection_new(void)
 {
     BluetoothConnection *conn = g_new0(BluetoothConnection, 1);

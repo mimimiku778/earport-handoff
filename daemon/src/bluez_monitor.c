@@ -468,3 +468,25 @@ void bluez_monitor_check_existing_devices(BluezMonitor *monitor)
     g_variant_unref(objects);
     g_variant_unref(result);
 }
+
+BluezDeviceInfo *bluez_monitor_find_connected_device(BluezMonitor *monitor,
+                                                      const char *exclude_address)
+{
+    if (monitor == NULL)
+        return NULL;
+
+    GHashTableIter iter;
+    gpointer value = NULL;
+    g_hash_table_iter_init(&iter, monitor->known_devices);
+
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        const BluezDeviceInfo *info = value;
+        if (info->connected && info->address != NULL &&
+            (exclude_address == NULL ||
+             g_ascii_strcasecmp(info->address, exclude_address) != 0)) {
+            return bluez_device_info_copy(info);
+        }
+    }
+
+    return NULL;
+}

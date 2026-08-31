@@ -16,6 +16,9 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_UUID="earport@anoryth.github.io"
 EXTENSION_DIR="$HOME/.local/share/gnome-shell/extensions/$EXTENSION_UUID"
+# The generated systemd and D-Bus launchers rely on standard XDG user search
+# paths, so keep the quick installer intentionally user-local.
+INSTALL_PREFIX="$HOME/.local"
 
 print_header() {
     echo -e "${BLUE}"
@@ -75,6 +78,12 @@ check_dependencies() {
         missing_deps+=("gnome-shell")
     fi
 
+    # Seamless handoff uses pactl to restart the AirPods A2DP stream after
+    # claiming audio ownership. PipeWire provides this through pipewire-pulse.
+    if ! command -v pactl &> /dev/null; then
+        missing_deps+=("pulseaudio-utils (pactl)")
+    fi
+
     if [ ${#missing_deps[@]} -ne 0 ]; then
         print_error "Missing dependencies:"
         for dep in "${missing_deps[@]}"; do
@@ -84,7 +93,7 @@ check_dependencies() {
         echo "Install them using your package manager:"
         echo ""
         echo "  Debian/Ubuntu:"
-        echo "    sudo apt install meson ninja-build pkg-config libglib2.0-dev libbluetooth-dev"
+        echo "    sudo apt install meson ninja-build pkg-config libglib2.0-dev libbluetooth-dev pulseaudio-utils"
         echo ""
         echo "  Fedora:"
         echo "    sudo dnf install meson ninja-build pkg-config glib2-devel bluez-libs-devel"
@@ -108,33 +117,44 @@ build_daemon() {
         rm -rf build
     fi
 
-    meson setup build
+    meson setup build --prefix="$INSTALL_PREFIX"
     ninja -C build
 
     print_success "Daemon built successfully"
 }
 
-remove_legacy_install() {
-    # Clean up a pre-rename LibrePods installation, if any
-    if systemctl --user list-unit-files librepods-daemon.service &> /dev/null; then
-        systemctl --user disable --now librepods-daemon.service 2>/dev/null || true
+check_conflicting_daemons() {
+    local conflict=false
+
+    # These projects may open the same proprietary AAP L2CAP channel. Never
+    # delete or stop another project implicitly; tell the user exactly what
+    # must be disabled and leave that decision to them.
+    for unit in airpods-handoff.service librepods-daemon.service; do
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null ||
+           systemctl --user is-enabled --quiet "$unit" 2>/dev/null; then
+            print_error "Conflicting user service is active or enabled: $unit"
+            echo "    Disable it first with:"
+            echo "    systemctl --user disable --now $unit"
+            conflict=true
+        fi
+    done
+
+    if command -v pgrep &> /dev/null && pgrep -x airpods-handoff &> /dev/null; then
+        print_error "A manually launched airpods-handoff process is running"
+        echo "    Stop it before installing EarPort Handoff."
+        conflict=true
     fi
 
-    if [ -f /usr/local/bin/librepods-daemon ]; then
-        print_step "Removing legacy LibrePods installation (requires sudo)..."
-        sudo rm -f /usr/local/bin/librepods-daemon \
-            /usr/local/lib/systemd/user/librepods-daemon.service \
-            /usr/local/share/dbus-1/services/org.librepods.Daemon.service
+    if [ "$conflict" = true ]; then
+        exit 1
     fi
-
-    rm -rf "$HOME/.local/share/gnome-shell/extensions/librepods@librepods.org"
 }
 
 install_daemon() {
-    print_step "Installing daemon (requires sudo)..."
+    print_step "Installing daemon to $INSTALL_PREFIX..."
 
     cd "$SCRIPT_DIR/daemon"
-    sudo ninja -C build install
+    meson install -C build
 
     print_success "Daemon installed"
 }
@@ -145,8 +165,10 @@ enable_daemon_service() {
     # Reload systemd user daemon
     systemctl --user daemon-reload
 
-    # Enable and start the service
-    systemctl --user enable --now earport-daemon.service
+    # Enabling an already running unit does not reload a newly installed
+    # executable, so restart explicitly for both fresh installs and upgrades.
+    systemctl --user enable earport-daemon.service
+    systemctl --user restart earport-daemon.service
 
     print_success "Daemon service enabled and started"
 }
@@ -180,8 +202,13 @@ enable_extension() {
 
     # Try to enable the extension
     if command -v gnome-extensions &> /dev/null; then
-        gnome-extensions enable "$EXTENSION_UUID" 2>/dev/null || true
-        print_success "Extension enabled"
+        if gnome-extensions enable "$EXTENSION_UUID"; then
+            print_success "Extension enabled"
+        else
+            print_warning "GNOME Shell has not loaded the new extension yet"
+            echo "    On Wayland, log out and back in, then run:"
+            echo "    gnome-extensions enable $EXTENSION_UUID"
+        fi
     else
         print_warning "Could not enable extension automatically"
         echo "    Please enable it manually via GNOME Extensions app"
@@ -221,11 +248,14 @@ uninstall() {
     print_success "Daemon service stopped"
 
     # Uninstall daemon
-    print_step "Uninstalling daemon (requires sudo)..."
-    if [ -d "$SCRIPT_DIR/daemon/build" ]; then
-        cd "$SCRIPT_DIR/daemon"
-        sudo ninja -C build uninstall 2>/dev/null || true
-    fi
+    print_step "Uninstalling daemon from $INSTALL_PREFIX..."
+    # Use exact installed paths so uninstall still works from a fresh clone or
+    # after the build directory has been removed.
+    rm -f \
+        "$INSTALL_PREFIX/bin/earport-daemon" \
+        "$INSTALL_PREFIX/share/systemd/user/earport-daemon.service" \
+        "$INSTALL_PREFIX/share/dbus-1/services/io.github.anoryth.EarPort.service"
+    systemctl --user daemon-reload
     print_success "Daemon uninstalled"
 
     # Remove extension
@@ -263,7 +293,7 @@ main() {
         --daemon)
             print_header
             check_dependencies
-            remove_legacy_install
+            check_conflicting_daemons
             build_daemon
             install_daemon
             enable_daemon_service
@@ -272,7 +302,7 @@ main() {
             ;;
         --extension)
             print_header
-            remove_legacy_install
+            check_conflicting_daemons
             install_extension
             enable_extension
             echo ""
@@ -285,7 +315,7 @@ main() {
         --install|"")
             print_header
             check_dependencies
-            remove_legacy_install
+            check_conflicting_daemons
             build_daemon
             install_daemon
             enable_daemon_service

@@ -24,6 +24,7 @@ typedef enum {
     AIRPODS_MODEL_PRO_3 = 0x2027,
     AIRPODS_MODEL_MAX = 0x0A20,
     AIRPODS_MODEL_MAX_USBC = 0x1F20,
+    AIRPODS_MODEL_MAX_2 = 0x2D20,
 } AirPodsModel;
 
 /* Noise control modes */
@@ -166,6 +167,9 @@ bool airpods_model_supports_adaptive(AirPodsModel model);
 
 /* Check if model is headphones (AirPods Max) vs earbuds */
 bool airpods_model_is_headphones(AirPodsModel model);
+
+/* Max 1 reports only the primary slot in AAP ear-detection packets. */
+bool airpods_model_uses_single_aap_wear_sensor(AirPodsModel model);
 
 /* Get model enum from model number string (e.g., "A2699" -> AIRPODS_MODEL_PRO_2) */
 AirPodsModel airpods_model_from_number(const char *model_number);

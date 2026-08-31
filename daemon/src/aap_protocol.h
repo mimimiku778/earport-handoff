@@ -29,6 +29,7 @@
 #define AAP_OPCODE_BATTERY       0x04
 #define AAP_OPCODE_EAR_DETECTION 0x06
 #define AAP_OPCODE_CONTROL       0x09
+#define AAP_OPCODE_AUDIO_SOURCE  0x0E
 #define AAP_OPCODE_NOTIFICATIONS 0x0F
 #define AAP_OPCODE_HEAD_TRACKING 0x17
 #define AAP_OPCODE_METADATA      0x1D
@@ -37,6 +38,7 @@
 
 /* Control command identifiers (byte after opcode 0x09) */
 #define AAP_CTRL_NOISE_CONTROL       0x0D
+#define AAP_CTRL_OWNS_CONNECTION     0x06
 #define AAP_CTRL_LISTENING_MODES     0x1A
 #define AAP_CTRL_ONE_BUD_ANC         0x1B
 #define AAP_CTRL_CONV_AWARENESS      0x28
@@ -94,6 +96,7 @@ typedef enum {
     AAP_PKT_TYPE_UNKNOWN,
     AAP_PKT_TYPE_BATTERY,
     AAP_PKT_TYPE_EAR_DETECTION,
+    AAP_PKT_TYPE_AUDIO_SOURCE,
     AAP_PKT_TYPE_NOISE_CONTROL,
     AAP_PKT_TYPE_CONV_AWARENESS,
     AAP_PKT_TYPE_CA_DETECTION,
@@ -118,6 +121,18 @@ typedef struct {
     bool primary_left;
 } AapEarDetectionData;
 
+/* Device currently providing audio to the AirPods (TiPi AudioSource). */
+typedef enum {
+    AAP_AUDIO_SOURCE_NONE = 0x00,
+    AAP_AUDIO_SOURCE_CALL = 0x01,
+    AAP_AUDIO_SOURCE_MEDIA = 0x02,
+} AapAudioSourceType;
+
+typedef struct {
+    uint8_t device_address[6];  /* Wire order (Bluetooth address reversed) */
+    AapAudioSourceType type;
+} AapAudioSourceData;
+
 /* Parsed metadata */
 typedef struct {
     char device_name[64];
@@ -140,6 +155,7 @@ typedef struct {
     union {
         AapBatteryData battery;
         AapEarDetectionData ear_detection;
+        AapAudioSourceData audio_source;
         NoiseControlMode noise_control;
         bool conversational_awareness;
         int ca_volume_level;
@@ -178,6 +194,9 @@ AapParseResult aap_parse_battery(const uint8_t *data, size_t len, AapBatteryData
  */
 AapParseResult aap_parse_ear_detection(const uint8_t *data, size_t len, AapEarDetectionData *ear);
 
+/** Parse a TiPi AudioSource notification (opcode 0x0E). */
+AapParseResult aap_parse_audio_source(const uint8_t *data, size_t len, AapAudioSourceData *source);
+
 /**
  * Parse noise control response
  */
@@ -206,6 +225,9 @@ void aap_build_adaptive_level_cmd(int level, uint8_t *buffer);
  * @param buffer Output buffer (must be AAP_CONTROL_CMD_SIZE bytes)
  */
 void aap_build_conv_awareness_cmd(bool enable, uint8_t *buffer);
+
+/** Build an OwnsConnection command used to claim/release the audio source. */
+void aap_build_owns_connection_cmd(bool claim, uint8_t *buffer);
 
 /**
  * Build listening modes configuration command

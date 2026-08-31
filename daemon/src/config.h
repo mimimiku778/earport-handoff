@@ -15,6 +15,7 @@
 /* Configuration data structure */
 typedef struct {
     int ear_pause_mode;   /* 0=disabled, 1=one_out, 2=both_out */
+    bool handoff_enabled; /* Claim/release AudioSource based on MPRIS playback */
 } EarPortConfig;
 
 /**

@@ -37,6 +37,17 @@ typedef void (*BtStateCallback)(BluetoothState state, const char *error, void *u
 typedef struct BluetoothConnection BluetoothConnection;
 
 /**
+ * Read this connected socket's local Bluetooth adapter address in AAP wire
+ * order.
+ *
+ * AudioSource notifications encode addresses least-significant byte first;
+ * bdaddr_t uses that same ordering, so the returned bytes can be compared
+ * directly with AapAudioSourceData.device_address.
+ */
+bool bt_connection_get_local_audio_source_address(BluetoothConnection *conn,
+                                                  uint8_t address[6]);
+
+/**
  * Create a new Bluetooth connection context
  *
  * @return New connection context or NULL on error

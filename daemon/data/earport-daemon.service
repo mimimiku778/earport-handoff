@@ -1,23 +1,24 @@
 [Unit]
 Description=EarPort AirPods Daemon
-Documentation=https://github.com/Anoryth/earport
+Documentation=https://github.com/mimimiku778/earport-handoff
 After=bluetooth.target
 
 [Service]
 Type=dbus
 BusName=io.github.anoryth.EarPort
-ExecStart=/usr/local/bin/earport-daemon
+ExecStart=@EARPORT_BINDIR@/earport-daemon
 Restart=on-failure
 RestartSec=5
 
-# Security hardening
+# Security hardening. The daemon uses an unprivileged L2CAP SEQPACKET socket;
+# it does not require CAP_NET_RAW or root privileges.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-# Creates $XDG_CONFIG_HOME/earport before sandboxing and keeps it writable
-# (ReadWritePaths= would fail at namespace setup while the dir is missing)
 ConfigurationDirectory=earport
+ConfigurationDirectoryMode=0700
 PrivateTmp=true
+UMask=0077
 
 [Install]
 WantedBy=default.target

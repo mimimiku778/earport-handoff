@@ -223,6 +223,8 @@ const char *airpods_model_to_string(AirPodsModel model)
         return "AirPods Max";
     case AIRPODS_MODEL_MAX_USBC:
         return "AirPods Max (USB-C)";
+    case AIRPODS_MODEL_MAX_2:
+        return "AirPods Max 2";
     default:
         return "Unknown AirPods";
     }
@@ -273,6 +275,7 @@ bool airpods_model_supports_anc(AirPodsModel model)
     case AIRPODS_MODEL_PRO_3:
     case AIRPODS_MODEL_MAX:
     case AIRPODS_MODEL_MAX_USBC:
+    case AIRPODS_MODEL_MAX_2:
     case AIRPODS_MODEL_4_ANC:
         return true;
     default:
@@ -286,6 +289,7 @@ bool airpods_model_supports_adaptive(AirPodsModel model)
     case AIRPODS_MODEL_PRO_2:
     case AIRPODS_MODEL_PRO_2_USBC:
     case AIRPODS_MODEL_PRO_3:
+    case AIRPODS_MODEL_MAX_2:
     case AIRPODS_MODEL_4_ANC:
         return true;
     default:
@@ -294,6 +298,18 @@ bool airpods_model_supports_adaptive(AirPodsModel model)
 }
 
 bool airpods_model_is_headphones(AirPodsModel model)
+{
+    switch (model) {
+    case AIRPODS_MODEL_MAX:
+    case AIRPODS_MODEL_MAX_USBC:
+    case AIRPODS_MODEL_MAX_2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool airpods_model_uses_single_aap_wear_sensor(AirPodsModel model)
 {
     switch (model) {
     case AIRPODS_MODEL_MAX:
@@ -350,6 +366,8 @@ AirPodsModel airpods_model_from_number(const char *model_number)
         {"A2096", AIRPODS_MODEL_MAX},
         /* AirPods Max (USB-C) */
         {"A3184", AIRPODS_MODEL_MAX_USBC},
+        /* AirPods Max 2 */
+        {"A3454", AIRPODS_MODEL_MAX_2},
         {NULL, AIRPODS_MODEL_UNKNOWN}
     };
 

@@ -1,11 +1,11 @@
 {
     "uuid": "earport@anoryth.github.io",
-    "name": "EarPort",
-    "description": "AirPods integration for GNOME - Battery status, noise control modes (ANC, Transparency, Adaptive), and advanced settings",
-    "version": 2,
-    "version-name": "0.2.0",
+    "name": "EarPort Handoff",
+    "description": "AirPods integration for GNOME with battery, noise control, wear detection, and Apple/Linux audio handoff",
+    "version": 3,
+    "version-name": "0.3.0",
     "shell-version": ["46", "47", "48", "49", "50"],
-    "url": "https://github.com/Anoryth/earport",
+    "url": "https://github.com/mimimiku778/earport-handoff",
     "settings-schema": "org.gnome.shell.extensions.earport",
     "gettext-domain": "earport"
 }

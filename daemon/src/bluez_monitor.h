@@ -80,6 +80,13 @@ void bluez_monitor_set_disconnected_callback(BluezMonitor *monitor,
 void bluez_monitor_check_existing_devices(BluezMonitor *monitor);
 
 /**
+ * Return a copy of any currently connected AirPods other than exclude_address.
+ * The caller owns the returned value. Returns NULL when no fallback exists.
+ */
+BluezDeviceInfo *bluez_monitor_find_connected_device(BluezMonitor *monitor,
+                                                      const char *exclude_address);
+
+/**
  * Free device info structure
  */
 void bluez_device_info_free(BluezDeviceInfo *info);

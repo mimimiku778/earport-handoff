@@ -1,203 +1,159 @@
-# EarPort
+# EarPort Handoff
 
-AirPods integration for GNOME Shell on Linux. This project provides full support for Apple AirPods features including battery status, noise control modes, and automatic media pause on ear detection.
+GNOME AirPods integration with experimental Apple/Linux audio handoff, AirPods Max 2 support, battery status, noise control, and automatic pause/resume on wear detection.
 
-![GNOME 46+](https://img.shields.io/badge/GNOME-46%2B-blue)
-![License](https://img.shields.io/badge/license-GPL--3.0-green)
+[![CI](https://github.com/mimimiku778/earport-handoff/actions/workflows/ci.yml/badge.svg)](https://github.com/mimimiku778/earport-handoff/actions/workflows/ci.yml)
+![GNOME 46–50](https://img.shields.io/badge/GNOME-46--50-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green)
+
+This is an experimental fork of [Anoryth/EarPort](https://github.com/Anoryth/earport). It uses one integrated Apple Accessory Protocol (AAP) connection, so battery, ANC, wear detection, and handoff do not compete for the same Bluetooth channel.
 
 ![EarPort Extension](extension.png)
 
-## Features
+## What it does
 
-- **Battery monitoring** - Real-time battery levels for left pod, right pod, and charging case
-- **Noise control modes** - Switch between Off, ANC, Transparency, and Adaptive modes
-- **Long press customization** - Configure which noise control modes cycle on stem long press
-- **Ear detection** - Automatic media pause/resume when removing/inserting AirPods
-- **Quick Settings integration** - Native GNOME Shell Quick Settings panel
-- **Quick mode switching** - Click the Quick Settings tile or use a configurable keyboard shortcut (default `Super+Shift+N`) to cycle noise control modes, with OSD feedback
-- **Notifications** - Connection/disconnection and low battery notifications
-- **Model detection** - Automatic detection of AirPods model with feature adaptation
-- **Per-device settings** - Settings are saved individually for each paired AirPods
-- **Translations** - Fully translatable (French included)
+- Claims the AirPods audio source when an MPRIS player starts on Linux.
+- Pauses Linux players when an iPhone, iPad, or Mac takes the AirPods.
+- Resumes only the players it paused when the Apple device releases them.
+- Does not steal the AirPods during a call on another device.
+- Delays handoff resume until the headphones are worn again.
+- Shows battery state and controls ANC, Transparency, Adaptive mode, and Conversation Awareness where supported.
+- Supports two paired AirPods and follows the most recently connected pair. Only one AAP control channel is active at a time.
 
-### Supported Models
+## Supported models
 
-| Model | Battery | ANC | Transparency | Adaptive |
-|-------|---------|-----|--------------|----------|
-| AirPods 1st/2nd Gen | ✓ | - | - | - |
-| AirPods 3rd Gen | ✓ | - | - | - |
-| AirPods 4th Gen | ✓ | - | - | - |
-| AirPods 4th Gen (ANC) | ✓ | ✓ | ✓ | ✓ |
-| AirPods Pro | ✓ | ✓ | ✓ | - |
-| AirPods Pro 2 | ✓ | ✓ | ✓ | ✓ |
-| AirPods Pro 3 | ✓ | ✓ | ✓ | ✓ |
-| AirPods Max | ✓ | ✓ | ✓ | - |
+| Model | Battery | Wear detection | ANC | Adaptive | Handoff |
+|---|:---:|:---:|:---:|:---:|:---:|
+| AirPods 1 / 2 | ✓ | ✓ | — | — | ✓ |
+| AirPods 3 | ✓ | ✓ | — | — | ✓ |
+| AirPods 4 | ✓ | ✓ | — | — | ✓ |
+| AirPods 4 with ANC | ✓ | ✓ | ✓ | ✓ | ✓ |
+| AirPods Pro | ✓ | ✓ | ✓ | — | ✓ |
+| AirPods Pro 2 / 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| AirPods Max (Lightning / USB-C) | ✓ | ✓ | ✓ | — | ✓ |
+| **AirPods Max 2 (A3454)** | ✓ | Experimental | ✓ | ✓ | ✓ |
 
-## Architecture
+AirPods 4 model numbers were already represented upstream and are now covered by tests. Max 2 support adds model `A3454` and protocol ID `0x2D20`. Max 2 keeps its raw two-slot AAP wear state; the single-sensor workaround is intentionally limited to first-generation AirPods Max.
 
-The project consists of two components:
+## Ubuntu installation
 
-1. **earport-daemon** - A C daemon that communicates with AirPods via Bluetooth L2CAP and exposes state via D-Bus
-2. **GNOME Shell Extension** - A JavaScript extension that displays AirPods status in Quick Settings
-
-## Requirements
-
-### Build Dependencies
+### 1. Install dependencies
 
 ```bash
-# Debian/Ubuntu
-sudo apt install meson ninja-build libglib2.0-dev libbluetooth-dev
-
-# Fedora
-sudo dnf install meson ninja-build glib2-devel bluez-libs-devel
-
-# Arch Linux
-sudo pacman -S meson ninja glib2 bluez-libs
+sudo apt update
+sudo apt install -y \
+  git meson ninja-build pkg-config \
+  libglib2.0-dev libbluetooth-dev \
+  pulseaudio-utils
 ```
 
-### Runtime Dependencies
+PipeWire is supported through its PulseAudio compatibility service.
 
-- GNOME Shell 46 or later
-- BlueZ (Bluetooth stack)
-- AirPods paired via Bluetooth settings
+### 2. Make BlueZ identify as an Apple Bluetooth host
 
-## Installation
-
-### Quick Install (Recommended)
+Back up the system configuration:
 
 ```bash
+sudo cp /etc/bluetooth/main.conf /etc/bluetooth/main.conf.pre-earport
+sudoedit /etc/bluetooth/main.conf
+```
+
+Add this line inside the existing `[General]` section (do not add a second `[General]` section):
+
+```ini
+DeviceID = bluetooth:004C:0000:0000
+```
+
+Restart Bluetooth:
+
+```bash
+sudo systemctl restart bluetooth
+```
+
+The DeviceID setting is system-wide. AirPods cache it at pairing time, so remove each AirPods pair from Ubuntu and pair it again after changing the setting.
+
+### 3. Install EarPort Handoff
+
+```bash
+git clone https://github.com/mimimiku778/earport-handoff.git
+cd earport-handoff
 ./install.sh
 ```
 
-This will build and install the daemon, enable the systemd service, and install the GNOME Shell extension.
+The installer places the daemon in `~/.local/bin`, installs a sandboxed systemd user service, and installs the GNOME extension. The daemon uses an unprivileged L2CAP `SOCK_SEQPACKET` connection and does not run as root or receive Linux capabilities.
 
-### Manual Installation
+On Wayland, log out and back in once so GNOME Shell loads the extension. Then connect either AirPods from GNOME Bluetooth settings.
 
-#### 1. Build and Install the Daemon
+Do not run [`xatuke/handoff`](https://github.com/xatuke/handoff) at the same time. Both programs would open the same proprietary AAP channel. If it was previously installed as a user service:
 
 ```bash
-cd daemon
-meson setup build
-ninja -C build
-sudo ninja -C build install
+systemctl --user disable --now airpods-handoff.service
 ```
 
-#### 2. Enable the Systemd User Service
+## Configuration
 
-```bash
-systemctl --user enable --now earport-daemon.service
+Handoff is enabled by default in `~/.config/earport/daemon.conf`:
+
+```ini
+[Settings]
+ear_pause_mode=1
+handoff_enabled=true
 ```
 
-#### 3. Install the GNOME Shell Extension
+Set `handoff_enabled=false` and restart the service to retain EarPort features without automatic audio ownership:
 
 ```bash
-# Copy extension to GNOME Shell extensions directory
-cp -r extension ~/.local/share/gnome-shell/extensions/earport@anoryth.github.io
+systemctl --user restart earport-daemon.service
+```
 
-# Enable the extension
+Ear-pause modes are `0` (off), `1` (pause when either side is removed), and `2` (pause only when both sides are removed).
+
+## Current limitations
+
+- This relies on reverse-engineered, private Apple protocols and may break after firmware or BlueZ changes.
+- An AirPods Bluetooth link to Linux must already exist for EarPort to control AAP. It does not initiate a disconnected device connection solely from application playback.
+- Playback detection is MPRIS-based. Browsers, Spotify, and common desktop players normally work; games and non-MPRIS applications may not trigger automatic claiming.
+- Two paired AirPods are supported sequentially, not simultaneously. The newest connected device owns the single control channel.
+- Max 2 model, ANC, and Adaptive capability handling are implemented and unit-tested; its AAP wear-event mapping still needs broader physical-device validation.
+- Apple's complete account-aware automatic switching cannot be reproduced on Linux. This implements audio-source ownership behavior, not Apple Account integration.
+
+## Troubleshooting
+
+Check the service and logs:
+
+```bash
+systemctl --user status earport-daemon.service
+journalctl --user -u earport-daemon.service -f
+```
+
+If BlueZ reports `br-connection-key-missing`, remove the affected AirPods from Bluetooth settings and pair it again after the DeviceID change.
+
+If the Quick Settings item is absent on Wayland, confirm that the extension is enabled and then log out and back in:
+
+```bash
 gnome-extensions enable earport@anoryth.github.io
 ```
 
-#### 4. Restart GNOME Shell
+## Development
 
-- **X11**: Press `Alt+F2`, type `r`, press Enter
-- **Wayland**: Log out and log back in
+```bash
+meson setup daemon/build daemon --buildtype=debug -Dwerror=true
+meson compile -C daemon/build
+meson test -C daemon/build --print-errorlogs
+```
 
-## Usage
+The daemon exposes `io.github.anoryth.EarPort` on the session bus. The existing D-Bus name and extension UUID are retained for compatibility with upstream EarPort.
 
-1. Pair your AirPods via GNOME Bluetooth settings
-2. Connect your AirPods
-3. The EarPort indicator will appear in the Quick Settings panel
-4. Click to expand and see battery levels and noise control options
+See [CREDITS](CREDITS) for protocol and upstream acknowledgements.
 
-### Ear Detection & Media Control
-
-By default, media will automatically pause when you remove one or both AirPods from your ears, and resume when you put them back in.
-
-## Uninstallation
-
-### Quick Uninstall
+## Uninstall
 
 ```bash
 ./install.sh --uninstall
 ```
 
-### Manual Uninstallation
-
-```bash
-# Stop and disable the daemon
-systemctl --user disable --now earport-daemon.service
-
-# Remove the daemon
-sudo ninja -C daemon/build uninstall
-
-# Remove the extension
-rm -rf ~/.local/share/gnome-shell/extensions/earport@anoryth.github.io
-
-# Restart GNOME Shell
-```
-
-## Troubleshooting
-
-### Daemon not starting
-
-Check the daemon logs:
-```bash
-journalctl --user -u earport-daemon.service -f
-```
-
-### Extension not appearing
-
-1. Ensure the extension is enabled:
-   ```bash
-   gnome-extensions list | grep earport
-   ```
-
-2. Check for extension errors:
-   ```bash
-   journalctl -f /usr/bin/gnome-shell
-   ```
-
-### AirPods not detected
-
-1. Ensure AirPods are paired and connected via Bluetooth
-2. Check if the daemon detects the device:
-   ```bash
-   journalctl --user -u earport-daemon.service | grep -i airpods
-   ```
-
-## Development
-
-### Testing the Daemon
-
-```bash
-# Run daemon in foreground with debug output
-G_MESSAGES_DEBUG=all ./daemon/build/earport-daemon
-```
-
-### D-Bus Interface
-
-The daemon exposes its interface at `io.github.anoryth.EarPort` on the session bus:
-
-```bash
-# Get battery levels
-gdbus call --session --dest io.github.anoryth.EarPort \
-  --object-path /io/github/anoryth/EarPort \
-  --method org.freedesktop.DBus.Properties.Get \
-  io.github.anoryth.EarPort1 BatteryLeft
-
-# Set noise control mode
-gdbus call --session --dest io.github.anoryth.EarPort \
-  --object-path /io/github/anoryth/EarPort \
-  --method io.github.anoryth.EarPort1.SetNoiseControlMode "anc"
-```
-
-## Credits
-
-This project is based on the protocol reverse-engineering work from the [LibrePods](https://github.com/kavishdevar/librepods) project by Kavish Devar. EarPort is an independent project and is not affiliated with LibrePods.
-
-AirPods is a trademark of Apple Inc. This project is not affiliated with or endorsed by Apple.
+The BlueZ DeviceID setting and Bluetooth pairings are system configuration and are intentionally not reverted by the uninstaller. Restore `/etc/bluetooth/main.conf.pre-earport` manually if desired.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+GPL-3.0-or-later. See [LICENSE](LICENSE). AirPods is a trademark of Apple Inc. This project is not affiliated with or endorsed by Apple.

@@ -17,6 +17,7 @@
 #include "bluetooth.h"
 #include "bluez_monitor.h"
 #include "config.h"
+#include "connection_policy.h"
 #include "dbus_service.h"
 #include "media_control.h"
 
@@ -38,12 +39,22 @@ typedef struct {
     guint reconnect_timeout_id;
     int reconnect_attempts;
     bool bluez_connected;   /* Device still connected at BlueZ level */
+
+    /* Seamless audio-source handoff state. AudioSource addresses use the
+     * same byte order as bdaddr_t, not the printable Bluetooth address. */
+    uint8_t local_audio_source_address[6];
+    bool local_audio_source_address_valid;
+    AapAudioSourceData current_audio_source;
+    bool current_audio_source_valid;
+    bool reclaim_when_audio_released;
+    gint64 last_audio_claim_time;
 } AppContext;
 
 /* L2CAP reconnection: AirPods frequently refuse the first L2CAP connect
  * right after the BlueZ link comes up, so retry with exponential backoff. */
 #define RECONNECT_MAX_ATTEMPTS 5
 #define RECONNECT_BASE_DELAY_SEC 2
+#define AUDIO_CLAIM_DEBOUNCE_USEC (500 * 1000)
 
 static AppContext app = {0};
 
@@ -54,6 +65,51 @@ static void apply_device_profile(const char *address);
 static gboolean apply_saved_settings_idle(gpointer user_data);
 static void schedule_reconnect(void);
 static void cancel_reconnect(void);
+static void on_media_playback_started(void *user_data);
+
+static void reset_audio_handoff_state(void)
+{
+    memset(&app.current_audio_source, 0, sizeof(app.current_audio_source));
+    app.current_audio_source_valid = false;
+    app.reclaim_when_audio_released = false;
+    app.last_audio_claim_time = 0;
+}
+
+static bool audio_source_is_local(const AapAudioSourceData *source)
+{
+    return source != NULL && app.local_audio_source_address_valid &&
+           memcmp(source->device_address,
+                  app.local_audio_source_address,
+                  sizeof(source->device_address)) == 0;
+}
+
+static void claim_audio_for_linux(bool restart_sink)
+{
+    if (!app.config.handoff_enabled)
+        return;
+
+    if (app.bt_conn == NULL || !bt_connection_is_connected(app.bt_conn)) {
+        g_debug("Cannot claim AirPods audio ownership: AAP is disconnected");
+        return;
+    }
+
+    uint8_t command[AAP_CONTROL_CMD_SIZE];
+    aap_build_owns_connection_cmd(true, command);
+    if (bt_connection_send(app.bt_conn, command, sizeof(command)) !=
+        (ssize_t)sizeof(command)) {
+        g_warning("Failed to send AirPods audio ownership claim");
+        return;
+    }
+
+    g_message("Claimed AirPods audio ownership for Linux");
+    app.last_audio_claim_time = g_get_monotonic_time();
+    if (restart_sink && app.media_control != NULL) {
+        const char *address = app.state.device_address != NULL
+                                ? app.state.device_address
+                                : app.pending_address;
+        media_control_reclaim_audio(app.media_control, address);
+    }
+}
 
 /* ============================================================================
  * Bluetooth data handling
@@ -111,13 +167,14 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
                   primary_in_ear ? "in" : "out",
                   secondary_in_ear ? "in" : "out");
 
-        /* AirPods Max have a single sensor: the secondary slot always reads
-         * "out", which would jam the one-out auto-pause logic. Mirror the
-         * primary status instead. */
+        /* AirPods Max 1 reports only the primary AAP wear slot; its secondary
+         * slot always reads "out", which would jam one-out auto-pause. Max 2
+         * has two physical sensors, so preserve both raw AAP slots there. */
         g_mutex_lock(&app.state.lock);
-        bool is_headphones = airpods_model_is_headphones(app.state.model);
+        bool single_wear_sensor =
+            airpods_model_uses_single_aap_wear_sensor(app.state.model);
         g_mutex_unlock(&app.state.lock);
-        if (is_headphones)
+        if (single_wear_sensor)
             secondary_in_ear = primary_in_ear;
 
         airpods_state_set_ear_detection(&app.state,
@@ -137,6 +194,75 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
                                                     app.state.ear_detection.left_in_ear,
                                                     app.state.ear_detection.right_in_ear);
         }
+        break;
+    }
+
+    case AAP_PKT_TYPE_AUDIO_SOURCE: {
+        const AapAudioSourceData *source = &packet.data.audio_source;
+        bool local_source = audio_source_is_local(source);
+        bool previous_source_was_local =
+            app.current_audio_source_valid &&
+            app.current_audio_source.type != AAP_AUDIO_SOURCE_NONE &&
+            audio_source_is_local(&app.current_audio_source);
+
+        const char *source_name = source->type == AAP_AUDIO_SOURCE_NONE ? "none" :
+                                  source->type == AAP_AUDIO_SOURCE_CALL ? "call" :
+                                                                         "media";
+        g_message("AirPods audio source changed: %s%s",
+                  source_name, local_source ? " (Linux)" : "");
+
+        if (!app.config.handoff_enabled) {
+            app.reclaim_when_audio_released = false;
+        } else if (source->type == AAP_AUDIO_SOURCE_NONE) {
+            if (app.reclaim_when_audio_released) {
+                g_message("Other device released AirPods audio; reclaiming for Linux");
+                MediaHandoffResumeResult resume_result = app.media_control != NULL
+                    ? media_control_resume_handoff(app.media_control)
+                    : MEDIA_HANDOFF_RESUME_NONE;
+
+                if (resume_result == MEDIA_HANDOFF_RESUME_STARTED) {
+                    /* Claim and restart once here. The resulting MPRIS
+                     * Playing signal is suppressed by the short debounce. */
+                    claim_audio_for_linux(true);
+                } else if (resume_result == MEDIA_HANDOFF_RESUME_NONE &&
+                           app.media_control != NULL) {
+                    claim_audio_for_linux(false);
+                    const char *address = app.state.device_address != NULL
+                                            ? app.state.device_address
+                                            : app.pending_address;
+                    media_control_reclaim_audio(app.media_control, address);
+                }
+                app.reclaim_when_audio_released = false;
+            }
+        } else if (local_source) {
+            /* This may be confirmation of our claim, or the first state sent
+             * after an AAP reconnect while Linux already regained ownership.
+             * In the latter case, finish the pending resume instead of
+             * leaving the players paused forever waiting for a NONE event. */
+            if (app.reclaim_when_audio_released && app.media_control != NULL) {
+                MediaHandoffResumeResult resume_result =
+                    media_control_resume_handoff(app.media_control);
+                if (resume_result == MEDIA_HANDOFF_RESUME_STARTED) {
+                    const char *address = app.state.device_address != NULL
+                                            ? app.state.device_address
+                                            : app.pending_address;
+                    media_control_reclaim_audio(app.media_control, address);
+                }
+            }
+            app.reclaim_when_audio_released = false;
+        } else if (app.local_audio_source_address_valid) {
+            bool linux_has_playing_media = app.media_control != NULL &&
+                                           media_control_is_playing(app.media_control);
+            if (previous_source_was_local || linux_has_playing_media) {
+                g_message("Another device took AirPods audio; pausing Linux media");
+                if (app.media_control != NULL)
+                    media_control_pause_all_for_handoff(app.media_control);
+                app.reclaim_when_audio_released = true;
+            }
+        }
+
+        app.current_audio_source = *source;
+        app.current_audio_source_valid = true;
         break;
     }
 
@@ -279,6 +405,10 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
         g_message("Bluetooth connected, sending handshake...");
         cancel_reconnect();
 
+        app.local_audio_source_address_valid =
+            bt_connection_get_local_audio_source_address(
+                app.bt_conn, app.local_audio_source_address);
+
         /* Attach to main loop for data reception */
         bt_connection_attach_to_mainloop(app.bt_conn, NULL);
 
@@ -385,7 +515,10 @@ static gboolean apply_saved_settings_idle(gpointer user_data)
 {
     const char *address = (const char *)user_data;
 
-    if (!app.bt_conn || !bt_connection_is_connected(app.bt_conn)) {
+    if (!app.bt_conn || !bt_connection_is_connected(app.bt_conn) ||
+        !airpods_address_equal(app.pending_address, address) ||
+        !airpods_address_equal(app.state.device_address, address)) {
+        g_debug("Skipping stale saved-settings task for %s", address);
         g_free((gchar *)address);
         return G_SOURCE_REMOVE;
     }
@@ -429,8 +562,15 @@ static gboolean apply_saved_settings_idle(gpointer user_data)
 
 static void connect_to_airpods(const char *address, const char *name)
 {
-    if (app.bt_conn && bt_connection_is_connected(app.bt_conn)) {
-        g_message("Already connected, ignoring connect request");
+    if (address == NULL || address[0] == '\0') {
+        g_warning("Cannot connect to AirPods without an address");
+        return;
+    }
+
+    if (app.bt_conn &&
+        bt_connection_get_state(app.bt_conn) != BT_STATE_DISCONNECTED) {
+        g_message("AAP connection already active for %s; ignoring duplicate request for %s",
+                  app.pending_address ? app.pending_address : "unknown", address);
         return;
     }
 
@@ -464,6 +604,46 @@ static void disconnect_from_airpods(void)
     }
 }
 
+static void on_media_playback_started(void *user_data)
+{
+    (void)user_data;
+
+    if (!app.config.handoff_enabled)
+        return;
+
+    if (app.bt_conn == NULL || !bt_connection_is_connected(app.bt_conn)) {
+        g_debug("Media playback started while AirPods AAP is disconnected");
+        return;
+    }
+
+    if (app.current_audio_source_valid &&
+        app.current_audio_source.type != AAP_AUDIO_SOURCE_NONE &&
+        audio_source_is_local(&app.current_audio_source)) {
+        g_debug("Linux already owns the AirPods audio source");
+        return;
+    }
+
+    if (app.current_audio_source_valid &&
+        app.current_audio_source.type == AAP_AUDIO_SOURCE_CALL &&
+        !audio_source_is_local(&app.current_audio_source)) {
+        g_message("Linux playback started during a call on another device; pausing until the call releases AirPods");
+        if (app.media_control != NULL)
+            media_control_pause_all_for_handoff(app.media_control);
+        app.reclaim_when_audio_released = true;
+        return;
+    }
+
+    gint64 now = g_get_monotonic_time();
+    if (app.last_audio_claim_time > 0 &&
+        now - app.last_audio_claim_time < AUDIO_CLAIM_DEBOUNCE_USEC) {
+        g_debug("Skipping duplicate AirPods ownership claim from MPRIS");
+        return;
+    }
+
+    g_message("Linux media playback started; requesting AirPods handoff");
+    claim_audio_for_linux(true);
+}
+
 /* ============================================================================
  * BlueZ callbacks
  * ========================================================================== */
@@ -472,6 +652,45 @@ static void on_bluez_device_connected(const BluezDeviceInfo *device, void *user_
 {
     (void)user_data;
     g_message("BlueZ: AirPods connected - %s (%s)", device->name, device->address);
+
+    if (device->address == NULL || device->address[0] == '\0')
+        return;
+
+    ConnectionDecision decision = connection_policy_device_connected(
+        app.pending_address, device->address);
+    if (decision == CONNECTION_DECISION_IGNORE)
+        return;
+
+    if (decision == CONNECTION_DECISION_CURRENT) {
+        /* Duplicate Connected events are common during BlueZ discovery. They
+         * must update link availability without resetting a healthy AAP
+         * channel or its reconnect backoff. */
+        app.bluez_connected = true;
+        if (app.bt_conn == NULL ||
+            bt_connection_get_state(app.bt_conn) == BT_STATE_DISCONNECTED) {
+            connect_to_airpods(device->address, device->name);
+        }
+        return;
+    }
+
+    if (decision == CONNECTION_DECISION_SWITCH) {
+        g_message("Switching EarPort from %s to newly connected AirPods %s",
+                  app.pending_address, device->address);
+
+        /* Suppress reconnect scheduling from the intentional old-socket
+         * close. connect_to_airpods installs the new target afterwards. */
+        app.bluez_connected = false;
+        cancel_reconnect();
+        disconnect_from_airpods();
+    }
+
+    /* This is a real BlueZ device selection, not a transient reconnect of
+     * the same AAP socket. Do not clear handoff pause ownership on the latter:
+     * the Apple source may still need to release before Linux can resume. */
+    reset_audio_handoff_state();
+    if (app.media_control != NULL)
+        media_control_reset_device_state(app.media_control);
+
     app.bluez_connected = true;
     app.reconnect_attempts = 0;
     connect_to_airpods(device->address, device->name);
@@ -481,9 +700,39 @@ static void on_bluez_device_disconnected(const BluezDeviceInfo *device, void *us
 {
     (void)user_data;
     g_message("BlueZ: AirPods disconnected - %s (%s)", device->name, device->address);
+
+    ConnectionDecision decision = connection_policy_device_disconnected(
+        app.pending_address, device->address);
+    if (decision != CONNECTION_DECISION_DISCONNECT_CURRENT) {
+        g_message("Ignoring disconnect for non-current AirPods %s",
+                  device->address ? device->address : "unknown");
+        return;
+    }
+
+    char *disconnected_address = g_strdup(app.pending_address);
     app.bluez_connected = false;
     cancel_reconnect();
     disconnect_from_airpods();
+
+    reset_audio_handoff_state();
+    if (app.media_control != NULL)
+        media_control_reset_device_state(app.media_control);
+
+    g_clear_pointer(&app.pending_address, g_free);
+    g_clear_pointer(&app.pending_name, g_free);
+
+    /* If another paired AirPods remains connected, move the sole AAP channel
+     * to it. This also makes startup deterministic when BlueZ reports more
+     * than one already-connected device. */
+    BluezDeviceInfo *fallback = bluez_monitor_find_connected_device(
+        app.bluez_monitor, disconnected_address);
+    if (fallback != NULL) {
+        g_message("Falling back to connected AirPods %s", fallback->address);
+        on_bluez_device_connected(fallback, NULL);
+        bluez_device_info_free(fallback);
+    }
+
+    g_free(disconnected_address);
 }
 
 /* ============================================================================
@@ -675,6 +924,7 @@ static void cleanup(void)
 {
     g_message("Cleaning up...");
 
+    app.bluez_connected = false;
     cancel_reconnect();
 
     if (app.bt_conn) {
@@ -757,6 +1007,9 @@ int main(int argc, char *argv[])
         /* Load ear pause mode from config */
         app.state.ear_pause_mode = app.config.ear_pause_mode;
         media_control_set_ear_pause_mode(app.media_control, (EarPauseMode)app.config.ear_pause_mode);
+        media_control_set_playback_started_callback(app.media_control,
+                                                    on_media_playback_started,
+                                                    NULL);
         g_message("Media control enabled (ear_pause_mode=%d)", app.config.ear_pause_mode);
     }
 

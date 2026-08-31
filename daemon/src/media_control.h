@@ -15,12 +15,20 @@
 /* Media control context */
 typedef struct MediaControl MediaControl;
 
+typedef void (*MediaPlaybackStartedCallback)(void *user_data);
+
 /* Ear detection mode for auto-pause behavior */
 typedef enum {
     EAR_PAUSE_DISABLED = 0,    /* Don't pause on ear removal */
     EAR_PAUSE_ONE_OUT = 1,     /* Pause when one pod is removed */
     EAR_PAUSE_BOTH_OUT = 2,    /* Pause when both pods are removed */
 } EarPauseMode;
+
+typedef enum {
+    MEDIA_HANDOFF_RESUME_NONE,
+    MEDIA_HANDOFF_RESUME_STARTED,
+    MEDIA_HANDOFF_RESUME_DEFERRED_FOR_EAR_STATE,
+} MediaHandoffResumeResult;
 
 /* Create new media control instance */
 MediaControl *media_control_new(void);
@@ -34,6 +42,14 @@ void media_control_set_ear_pause_mode(MediaControl *mc, EarPauseMode mode);
 /* Get current ear pause mode */
 EarPauseMode media_control_get_ear_pause_mode(MediaControl *mc);
 
+/* Notify a caller whenever an MPRIS player transitions to Playing. */
+void media_control_set_playback_started_callback(MediaControl *mc,
+                                                 MediaPlaybackStartedCallback callback,
+                                                 void *user_data);
+
+/* Forget per-device edge and resume tracking when switching AirPods. */
+void media_control_reset_device_state(MediaControl *mc);
+
 /* Update ear detection state - will trigger pause/play as needed */
 void media_control_on_ear_detection_changed(MediaControl *mc,
                                             bool left_in_ear,
@@ -41,6 +57,18 @@ void media_control_on_ear_detection_changed(MediaControl *mc,
 
 /* Pause all playing media players */
 void media_control_pause_all(MediaControl *mc);
+
+/* Pause and track players specifically for an AudioSource handoff. */
+void media_control_pause_all_for_handoff(MediaControl *mc);
+
+/* Resume only players paused for handoff, deferring while AirPods are out. */
+MediaHandoffResumeResult media_control_resume_handoff(MediaControl *mc);
+
+/* Check whether at least one MPRIS player currently reports Playing. */
+bool media_control_is_playing(MediaControl *mc);
+
+/* Restart the AirPods audio sink after claiming AudioSource ownership. */
+bool media_control_reclaim_audio(MediaControl *mc, const char *device_address);
 
 /* Resume media players that were paused by us */
 void media_control_resume(MediaControl *mc);

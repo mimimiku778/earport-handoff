@@ -156,6 +156,24 @@ AapParseResult aap_parse_ear_detection(const uint8_t *data, size_t len, AapEarDe
     return AAP_PARSE_OK;
 }
 
+AapParseResult aap_parse_audio_source(const uint8_t *data, size_t len, AapAudioSourceData *source)
+{
+    /* Packet: 04 00 04 00 0E [unknown] [6-byte address] [source type] */
+    if (len < 13)
+        return AAP_PARSE_INCOMPLETE;
+
+    if (data[4] != AAP_OPCODE_AUDIO_SOURCE)
+        return AAP_PARSE_MALFORMED;
+
+    uint8_t source_type = data[12];
+    if (source_type > AAP_AUDIO_SOURCE_MEDIA)
+        return AAP_PARSE_MALFORMED;
+
+    memcpy(source->device_address, data + 6, sizeof(source->device_address));
+    source->type = (AapAudioSourceType)source_type;
+    return AAP_PARSE_OK;
+}
+
 AapParseResult aap_parse_noise_control(const uint8_t *data, size_t len, NoiseControlMode *mode)
 {
     /* Control response: 04 00 04 00 09 00 0D [mode] ... */
@@ -282,6 +300,10 @@ AapParseResult aap_parse_packet(const uint8_t *data, size_t len, AapParsedPacket
         result->type = AAP_PKT_TYPE_EAR_DETECTION;
         return aap_parse_ear_detection(data, len, &result->data.ear_detection);
 
+    case AAP_OPCODE_AUDIO_SOURCE:
+        result->type = AAP_PKT_TYPE_AUDIO_SOURCE;
+        return aap_parse_audio_source(data, len, &result->data.audio_source);
+
     case AAP_OPCODE_CONTROL:
         return parse_control_packet(data, len, result);
 
@@ -341,6 +363,22 @@ void aap_build_adaptive_level_cmd(int level, uint8_t *buffer)
 void aap_build_conv_awareness_cmd(bool enable, uint8_t *buffer)
 {
     memcpy(buffer, enable ? AAP_PKT_CA_ENABLE : AAP_PKT_CA_DISABLE, AAP_CONTROL_CMD_SIZE);
+}
+
+void aap_build_owns_connection_cmd(bool claim, uint8_t *buffer)
+{
+    /* 04 00 04 00 09 00 06 [claim] 00 00 00 */
+    buffer[0] = 0x04;
+    buffer[1] = 0x00;
+    buffer[2] = 0x04;
+    buffer[3] = 0x00;
+    buffer[4] = AAP_OPCODE_CONTROL;
+    buffer[5] = 0x00;
+    buffer[6] = AAP_CTRL_OWNS_CONNECTION;
+    buffer[7] = claim ? 0x01 : 0x00;
+    buffer[8] = 0x00;
+    buffer[9] = 0x00;
+    buffer[10] = 0x00;
 }
 
 void aap_build_listening_modes_cmd(uint8_t modes, uint8_t *buffer)

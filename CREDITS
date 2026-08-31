@@ -1,21 +1,40 @@
-LibrePods GNOME - Credits and Acknowledgments
+EarPort Handoff — credits and acknowledgements
+================================================
 
-This project would not have been possible without the following contributions:
+Upstream application
+--------------------
 
-Protocol Research & Original Implementation
--------------------------------------------
-LibrePods by Kavish Devar (@kavishdevar)
-https://github.com/kavishdevar/librepods
-License: GPL-3.0
+This repository is a modified fork of EarPort by Anoryth and its contributors:
+https://github.com/Anoryth/earport
+License: GPL-3.0-or-later
 
-The Apple AirPods Protocol (AAP) implementation in this project is based on
-the reverse-engineering work done by the LibrePods project.
+Fork modifications for Max 2 support and audio handoff were made in August
+2026.
 
-Key Contributors to Original Protocol Documentation
-----------------------------------------------------
-- @tyalie - Protocol documentation
-- @tim-gromeyer - Linux implementation work
-- @devnoname120 - Root patch assistance
-- @rithvikvibhu - Hearing aid feature support
+The GNOME extension, daemon architecture, existing AirPods feature support,
+and much of the source history come from that project. Git history and
+copyright notices are retained.
 
-And all 47+ contributors to the LibrePods project.
+Protocol research
+-----------------
+
+Apple Accessory Protocol parsing and the independently implemented handoff
+messages are informed by the GPL-licensed LibrePods code and documentation:
+https://github.com/librepods-org/librepods
+
+AirPods Max 2 model identifiers and capability behavior were cross-checked
+against the GPL-licensed CAPod project:
+https://github.com/d4rken-org/capod
+
+The independent xatuke/handoff experiment helped demonstrate the intended
+Apple/Linux ownership behavior:
+https://github.com/xatuke/handoff
+
+No source code was copied from xatuke/handoff; its repository does not include
+a license file at the time this fork was prepared.
+
+Trademark notice
+----------------
+
+AirPods and Apple are trademarks of Apple Inc. This project is independent
+and is not affiliated with or endorsed by Apple.

@@ -1,5 +1,5 @@
 project('earport-daemon', 'c',
-    version: '0.2.0',
+    version: '0.3.0',
     license: 'GPL-3.0-or-later',
     default_options: [
         'c_std=c11',
@@ -35,6 +35,7 @@ sources = files(
     'src/config.c',
     'src/dbus_service.c',
     'src/media_control.c',
+    'src/connection_policy.c',
 )
 
 # Build executable
@@ -45,12 +46,50 @@ executable('earport-daemon',
     install_dir: get_option('bindir'),
 )
 
-# Install systemd user service
-install_data('data/earport-daemon.service',
-    install_dir: join_paths(get_option('prefix'), 'lib', 'systemd', 'user')
+test_models = executable(
+    'test-models',
+    files('tests/test_models.c', 'src/airpods_state.c', 'src/config.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('models', test_models)
+
+test_aap_protocol = executable(
+    'test-aap-protocol',
+    files('tests/test_aap_protocol.c', 'src/aap_protocol.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('aap-protocol', test_aap_protocol)
+
+test_connection_policy = executable(
+    'test-connection-policy',
+    files('tests/test_connection_policy.c', 'src/connection_policy.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('connection-policy', test_connection_policy)
+
+# Generate launcher files with the configured install prefix.  This keeps a
+# user-local install (the default used by install.sh) self-contained instead
+# of hard-coding /usr/local/bin.
+service_conf = configuration_data()
+service_conf.set(
+    'EARPORT_BINDIR',
+    join_paths(get_option('prefix'), get_option('bindir')),
 )
 
-# Install D-Bus service file
-install_data('data/io.github.anoryth.EarPort.service',
-    install_dir: join_paths(get_option('datadir'), 'dbus-1', 'services')
+# XDG_DATA_HOME/systemd/user is in the systemd user-unit search path.
+configure_file(
+    input: 'data/earport-daemon.service',
+    output: 'earport-daemon.service',
+    configuration: service_conf,
+    install_dir: join_paths(get_option('datadir'), 'systemd', 'user'),
+)
+
+configure_file(
+    input: 'data/io.github.anoryth.EarPort.service',
+    output: 'io.github.anoryth.EarPort.service',
+    configuration: service_conf,
+    install_dir: join_paths(get_option('datadir'), 'dbus-1', 'services'),
 )
