@@ -367,6 +367,8 @@ static void reset_audio_handoff_state(void)
     app.current_audio_source_valid = false;
     handoff_policy_reset(&app.handoff_policy);
     app.last_audio_claim_time = 0;
+    if (app.media_control != NULL)
+        media_control_set_airpods_audio_active(app.media_control, false);
 }
 
 static bool audio_source_is_local(const AapAudioSourceData *source)
@@ -388,9 +390,9 @@ static bool claim_audio_for_linux(bool restart_sink)
     if (!app.config.handoff_enabled)
         return false;
 
-    if (app.media_control != NULL &&
-        media_control_wear_state_blocks_playback(app.media_control)) {
-        g_debug("Cannot claim AirPods audio ownership while they are not worn");
+    if (app.media_control == NULL ||
+        !media_control_can_claim_or_route_audio(app.media_control)) {
+        g_debug("Cannot claim AirPods audio ownership without a fresh, allowed wear state on the live AAP link");
         return false;
     }
 
@@ -609,10 +611,9 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         bool remote_source = audio_source_is_remote(source);
         bool was_yielded_to_remote =
             handoff_policy_is_yielded(&app.handoff_policy);
-        bool previous_source_was_local =
-            app.current_audio_source_valid &&
-            app.current_audio_source.type != AAP_AUDIO_SOURCE_NONE &&
-            audio_source_is_local(&app.current_audio_source);
+        bool linux_source_was_confirmed =
+            handoff_policy_has_confirmed_linux_source(
+                &app.handoff_policy);
         bool previous_source_was_remote =
             app.current_audio_source_valid &&
             app.current_audio_source.type != AAP_AUDIO_SOURCE_NONE &&
@@ -639,30 +640,46 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         app.current_audio_source = *source;
         app.current_audio_source_valid = true;
 
-        if (!app.config.handoff_enabled) {
-            handoff_policy_reset(&app.handoff_policy);
-        } else if (source->type != AAP_AUDIO_SOURCE_NONE && remote_source) {
+        if (source->type != AAP_AUDIO_SOURCE_NONE && remote_source) {
             handoff_policy_note_source(&app.handoff_policy,
                                        HANDOFF_SOURCE_REMOTE);
 
-            /* AirPods 4 needs an explicit acknowledgement that Linux yields
-             * ownership when another device takes media or a call. Do this
-             * once on the local/none -> remote transition, before pausing. */
-            if (entered_remote_source && !was_yielded_to_remote)
-                release_audio_from_linux();
-            if (entered_remote_source)
-                suppress_wear_reconnect_until_removal();
-
-            bool linux_has_playing_media = app.media_control != NULL &&
-                                           media_control_is_playing(app.media_control);
-            if (previous_source_was_local || linux_has_playing_media) {
-                g_message("Another device took AirPods audio; pausing Linux media");
-                if (app.media_control != NULL)
-                    media_control_pause_all_for_handoff(app.media_control);
+            if (app.config.handoff_enabled) {
+                /* AirPods 4 needs an explicit acknowledgement that Linux
+                 * yields ownership when another device takes media or a
+                 * call. Do this once on the local/none -> remote transition,
+                 * before pausing. */
+                if (entered_remote_source && !was_yielded_to_remote)
+                    release_audio_from_linux();
+                if (entered_remote_source)
+                    suppress_wear_reconnect_until_removal();
             }
-        } else if (local_source) {
+
+            /* MPRIS Playing alone says nothing about its output. Pause only
+             * after AirPods positively reported Linux as their source in this
+             * AAP generation. Sticky confirmation preserves the real
+             * LOCAL -> NONE -> REMOTE handoff without touching speakers. */
+            if (app.config.handoff_enabled &&
+                !was_yielded_to_remote &&
+                linux_source_was_confirmed &&
+                app.media_control != NULL &&
+                media_control_is_playing(app.media_control)) {
+                g_message("Another device took AirPods audio; pausing Linux media");
+                media_control_pause_all_for_handoff(app.media_control);
+            }
+
+            if (app.media_control != NULL) {
+                media_control_set_airpods_audio_active(app.media_control,
+                                                       false);
+                media_control_cancel_audio_route(app.media_control);
+            }
+            app.last_audio_claim_time = 0;
+        } else if (source->type != AAP_AUDIO_SOURCE_NONE && local_source) {
             handoff_policy_note_source(&app.handoff_policy,
                                        HANDOFF_SOURCE_LOCAL);
+            if (app.media_control != NULL)
+                media_control_set_airpods_audio_active(app.media_control,
+                                                       true);
         } else if (source->type == AAP_AUDIO_SOURCE_NONE) {
             handoff_policy_note_source(&app.handoff_policy,
                                        HANDOFF_SOURCE_NONE);
@@ -682,20 +699,36 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
     }
 
     case AAP_PKT_TYPE_OWNERSHIP_RELEASE_REQUEST: {
-        if (!app.config.handoff_enabled)
-            break;
-
         bool newly_yielded =
             !handoff_policy_is_yielded(&app.handoff_policy);
+        bool linux_source_was_confirmed =
+            handoff_policy_has_confirmed_linux_source(
+                &app.handoff_policy);
+        bool linux_media_was_playing = app.media_control != NULL &&
+            media_control_is_playing(app.media_control);
         handoff_policy_note_remote_request(&app.handoff_policy);
         app.last_audio_claim_time = 0;
+
+        if (!app.config.handoff_enabled) {
+            if (app.media_control != NULL) {
+                media_control_set_airpods_audio_active(app.media_control,
+                                                       false);
+                media_control_cancel_audio_route(app.media_control);
+            }
+            break;
+        }
+
         g_message("Another Apple device requested AirPods ownership; yielding Linux audio");
         if (newly_yielded)
             release_audio_from_linux();
         suppress_wear_reconnect_until_removal();
-        if (app.media_control != NULL &&
-            media_control_is_playing(app.media_control)) {
+        if (newly_yielded && linux_source_was_confirmed &&
+            linux_media_was_playing) {
             media_control_pause_all_for_handoff(app.media_control);
+        }
+        if (app.media_control != NULL) {
+            media_control_set_airpods_audio_active(app.media_control, false);
+            media_control_cancel_audio_route(app.media_control);
         }
         break;
     }
@@ -849,6 +882,8 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
     switch (state) {
     case BT_STATE_CONNECTED:
         g_message("Bluetooth connected, sending handshake...");
+        if (app.media_control != NULL)
+            media_control_set_airpods_link_active(app.media_control, true);
         cancel_reconnect();
         reset_aap_initialization();
         app.connection_generation++;
@@ -890,6 +925,9 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
 
     case BT_STATE_DISCONNECTED:
         g_message("Bluetooth disconnected");
+        if (app.media_control != NULL)
+            media_control_set_airpods_link_active(app.media_control, false);
+        reset_audio_handoff_state();
         reset_aap_initialization();
 
         if (app.state.connected) {
@@ -908,6 +946,9 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
 
     case BT_STATE_ERROR:
         g_warning("Bluetooth error: %s", error ? error : "unknown");
+        if (app.media_control != NULL)
+            media_control_set_airpods_link_active(app.media_control, false);
+        reset_audio_handoff_state();
         reset_aap_initialization();
         schedule_reconnect();
         break;
@@ -1131,19 +1172,14 @@ static void on_media_playback_started(void *user_data)
     if (app.current_audio_source_valid &&
         app.current_audio_source.type == AAP_AUDIO_SOURCE_CALL &&
         audio_source_is_remote(&app.current_audio_source)) {
-        g_message("Linux playback started during a call on another device; pausing until the call releases AirPods");
-        if (app.media_control != NULL)
-            media_control_pause_all_for_handoff(app.media_control);
+        g_message("Linux playback started during a call on another device; leaving it on the current speaker output");
         handoff_policy_note_remote_request(&app.handoff_policy);
         return;
     }
 
     /* A Playing transition is the only event allowed to take ownership back
-     * after an Apple-device handoff. The user has already started playback,
-     * so merely forget our old pause reason without sending another Play. */
-    if (app.media_control != NULL)
-        media_control_clear_handoff_pause(app.media_control);
-
+     * after an Apple-device handoff. MediaControl has already reconciled the
+     * one player that the user explicitly restarted. */
     gint64 now = g_get_monotonic_time();
     if (app.last_audio_claim_time > 0 &&
         now - app.last_audio_claim_time < AUDIO_CLAIM_DEBOUNCE_USEC &&
@@ -1161,8 +1197,14 @@ static void on_media_playback_stopped(void *user_data)
 {
     (void)user_data;
 
-    if (!app.config.handoff_enabled ||
-        app.bt_conn == NULL || !bt_connection_is_connected(app.bt_conn) ||
+    if (!app.config.handoff_enabled) {
+        handoff_policy_reset(&app.handoff_policy);
+        if (app.media_control != NULL)
+            media_control_set_airpods_audio_active(app.media_control, false);
+        return;
+    }
+
+    if (app.bt_conn == NULL || !bt_connection_is_connected(app.bt_conn) ||
         handoff_policy_is_yielded(&app.handoff_policy) ||
         (app.current_audio_source_valid &&
          app.current_audio_source.type != AAP_AUDIO_SOURCE_NONE &&
@@ -1175,11 +1217,8 @@ static void on_media_playback_stopped(void *user_data)
     if (release_audio_from_linux()) {
         /* Treat the successful command as an optimistic release so playback
          * restarted before the AudioSource notification can claim again. */
-        memset(&app.current_audio_source, 0,
-               sizeof(app.current_audio_source));
+        reset_audio_handoff_state();
         app.current_audio_source_valid = true;
-        handoff_policy_reset(&app.handoff_policy);
-        app.last_audio_claim_time = 0;
     }
 }
 
@@ -1249,8 +1288,6 @@ static void on_bluez_device_connected(const BluezDeviceInfo *device, void *user_
     app.bluez_connected = true;
     app.reconnect_attempts = 0;
     connect_to_airpods(device->address, device->name);
-    if (app.media_control != NULL)
-        media_control_route_audio_to_device(app.media_control, device->address);
 }
 
 static void on_bluez_device_disconnected(const BluezDeviceInfo *device, void *user_data)
@@ -1291,6 +1328,8 @@ static void on_bluez_device_disconnected(const BluezDeviceInfo *device, void *us
                                             disconnected_address);
 
     app.bluez_connected = false;
+    if (app.media_control != NULL)
+        media_control_set_airpods_link_active(app.media_control, false);
     cancel_removal_disconnect();
     cancel_reconnect();
     reset_aap_initialization();

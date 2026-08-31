@@ -47,6 +47,8 @@ struct MediaControl {
     guint name_owner_signal_id;
     EarPauseMode ear_pause_mode;
     MediaPlaybackTracker *playback_tracker;
+    bool airpods_link_active;
+    bool airpods_audio_active;
 
     MediaPlaybackStartedCallback playback_started_callback;
     void *playback_started_user_data;
@@ -82,6 +84,9 @@ static void pause_all_into(MediaControl *mc,
 static void query_player_playback_status_async(MediaControl *mc,
                                                const gchar *player_name,
                                                bool suppress_transition);
+static bool player_play_async(MediaControl *mc, const gchar *player_name);
+static bool player_list_contains(GList *players, const gchar *player_name);
+static void player_list_remove(GList **players, const gchar *player_name);
 
 static MediaControl *media_control_ref(MediaControl *mc)
 {
@@ -107,19 +112,52 @@ static void media_control_unref(MediaControl *mc)
     g_free(mc);
 }
 
-static void handle_playback_transition(MediaControl *mc,
-                                       MediaPlaybackTransition transition)
+static void reconcile_explicit_player_start(MediaControl *mc,
+                                            const gchar *player_name)
 {
+    if (player_name == NULL || player_name[0] == '\0')
+        return;
+
+    bool ear_pause_pending =
+        g_hash_table_contains(mc->ear_pending_pauses, player_name);
+    bool ear_pause_owned =
+        player_list_contains(mc->ear_paused_players, player_name);
+    bool handoff_pause_pending =
+        g_hash_table_contains(mc->handoff_pending_pauses, player_name);
+    bool handoff_pause_owned =
+        player_list_contains(mc->handoff_paused_players, player_name);
+    if (!ear_pause_pending && !ear_pause_owned &&
+        !handoff_pause_pending && !handoff_pause_owned) {
+        return;
+    }
+
+    /* The user explicitly restarted this player. If either Pause is still in
+     * flight, queue one Play for this same D-Bus owner so it is ordered after
+     * both calls. Never wake another player. */
+    if (ear_pause_pending || handoff_pause_pending)
+        player_play_async(mc, player_name);
+
+    g_hash_table_remove(mc->ear_pending_pauses, player_name);
+    g_hash_table_remove(mc->handoff_pending_pauses, player_name);
+    player_list_remove(&mc->ear_paused_players, player_name);
+    player_list_remove(&mc->handoff_paused_players, player_name);
+    g_debug("Explicit playback start cleared pause ownership for %s",
+            player_name);
+}
+
+static void handle_playback_update(MediaControl *mc,
+                                   MediaPlaybackTransition transition,
+                                   const gchar *player_name,
+                                   bool player_started)
+{
+    if (player_started)
+        reconcile_explicit_player_start(mc, player_name);
+
     if (transition == MEDIA_PLAYBACK_TRANSITION_STARTED) {
-        if (wear_policy_blocks_playback(mc->ear_pause_mode,
-                                        mc->prev_state_valid,
-                                        mc->prev_left_in_ear,
-                                        mc->prev_right_in_ear)) {
-            /* A player may be restarted repeatedly while the AirPods are
-             * off-head. Pause it again without claiming audio ownership. */
-            g_message("Media started while AirPods are not worn; pausing");
-            pause_all_into(mc, MPRIS_ACTION_PAUSE_FOR_EAR, true);
-        } else if (mc->playback_started_callback != NULL) {
+        /* Ear removal is an edge-triggered pause. A later explicit MPRIS
+         * start is allowed to continue on speakers; claim/reroute policy in
+         * main independently fails closed while wear is unknown or blocked. */
+        if (mc->playback_started_callback != NULL) {
             MediaPlaybackStartedCallback callback =
                 mc->playback_started_callback;
             void *user_data = mc->playback_started_user_data;
@@ -191,6 +229,8 @@ static void on_mpris_properties_changed(GDBusConnection *connection G_GNUC_UNUSE
     GVariant *changed = NULL;
     GVariant *invalidated = NULL;
     MediaPlaybackTransition transition = MEDIA_PLAYBACK_TRANSITION_NONE;
+    bool player_started = false;
+    bool playing = false;
 
     g_variant_get(parameters, "(&s@a{sv}@as)",
                   &changed_interface, &changed, &invalidated);
@@ -202,18 +242,24 @@ static void on_mpris_properties_changed(GDBusConnection *connection G_GNUC_UNUSE
             /* A signal is newer and more authoritative than an outstanding
              * one-shot Get issued when this owner appeared. */
             g_hash_table_remove(mc->pending_status_queries, sender_name);
-            bool playing = g_strcmp0(g_variant_get_string(status, NULL),
-                                     "Playing") == 0;
+            playing = g_strcmp0(g_variant_get_string(status, NULL),
+                                "Playing") == 0;
+            bool was_playing = media_playback_tracker_player_is_playing(
+                mc->playback_tracker, sender_name);
             transition = media_playback_tracker_update(mc->playback_tracker,
                                                        sender_name,
                                                        playing);
+            player_started = playing && !was_playing;
             g_variant_unref(status);
         }
     }
 
     g_variant_unref(changed);
     g_variant_unref(invalidated);
-    handle_playback_transition(mc, transition);
+    handle_playback_update(mc,
+                           transition,
+                           player_started ? sender_name : NULL,
+                           player_started);
 }
 
 static void player_list_remove(GList **players, const gchar *player_name)
@@ -269,7 +315,7 @@ static void on_name_owner_changed(GDBusConnection *connection G_GNUC_UNUSED,
                                       old_owner_was_playing);
         query_player_playback_status_async(mc, new_owner, false);
     } else {
-        handle_playback_transition(mc, removal_transition);
+        handle_playback_update(mc, removal_transition, NULL, false);
     }
 }
 
@@ -360,6 +406,8 @@ static void on_player_status_finished(GObject *source_object,
             g_variant_unref(boxed);
         }
 
+        bool was_playing = media_playback_tracker_player_is_playing(
+            mc->playback_tracker, operation->player_name);
         MediaPlaybackTransition transition = valid_status
             ? media_playback_tracker_update(mc->playback_tracker,
                                             operation->player_name,
@@ -367,7 +415,10 @@ static void on_player_status_finished(GObject *source_object,
             : media_playback_tracker_remove(mc->playback_tracker,
                                             operation->player_name);
         if (!operation->suppress_transition)
-            handle_playback_transition(mc, transition);
+            handle_playback_update(mc,
+                                   transition,
+                                   operation->player_name,
+                                   valid_status && playing && !was_playing);
 
         if (!valid_status && error != NULL &&
             !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -633,6 +684,8 @@ MediaControl *media_control_new(void)
     mc->status_cancellable = g_cancellable_new();
 
     mc->ear_pause_mode = EAR_PAUSE_ONE_OUT;  /* Default: pause when one pod is removed */
+    mc->airpods_link_active = false;
+    mc->airpods_audio_active = false;
     mc->ear_paused_players = NULL;
     mc->handoff_paused_players = NULL;
     mc->prev_state_valid = false;
@@ -749,6 +802,34 @@ void media_control_set_playback_stopped_callback(MediaControl *mc,
     mc->playback_stopped_user_data = user_data;
 }
 
+void media_control_set_airpods_link_active(MediaControl *mc, bool active)
+{
+    if (mc == NULL || mc->airpods_link_active == active)
+        return;
+
+    mc->airpods_link_active = active;
+
+    if (!active) {
+        /* AAP wear reports describe only the session that delivered them.
+         * Fail open immediately when that session ends.  Pause ownership is
+         * intentionally kept: if removal caused the disconnect, the first
+         * fresh worn report after reconnect resumes only our own players. */
+        mc->prev_state_valid = false;
+        mc->airpods_audio_active = false;
+        audio_route_cancel(mc->audio_route);
+    }
+}
+
+void media_control_set_airpods_audio_active(MediaControl *mc, bool active)
+{
+    if (mc == NULL)
+        return;
+
+    /* Source notifications are meaningful only inside the current AAP
+     * session.  Refuse to carry a positive value across link generations. */
+    mc->airpods_audio_active = active && mc->airpods_link_active;
+}
+
 void media_control_reset_device_state(MediaControl *mc)
 {
     if (mc == NULL)
@@ -764,6 +845,8 @@ void media_control_reset_device_state(MediaControl *mc)
     g_clear_object(&mc->mpris_cancellable);
     mc->mpris_cancellable = g_cancellable_new();
 
+    mc->airpods_link_active = false;
+    mc->airpods_audio_active = false;
     mc->prev_state_valid = false;
     g_list_free_full(mc->ear_paused_players, g_free);
     mc->ear_paused_players = NULL;
@@ -777,13 +860,14 @@ void media_control_on_ear_detection_changed(MediaControl *mc,
                                             bool left_in_ear,
                                             bool right_in_ear)
 {
-    if (mc == NULL) {
+    if (mc == NULL || !mc->airpods_link_active) {
         return;
     }
 
+    bool previous_state_valid = mc->prev_state_valid;
     WearPolicyAction action = wear_policy_transition(
         mc->ear_pause_mode,
-        mc->prev_state_valid,
+        previous_state_valid,
         mc->prev_left_in_ear,
         mc->prev_right_in_ear,
         left_in_ear,
@@ -794,10 +878,27 @@ void media_control_on_ear_detection_changed(MediaControl *mc,
     mc->prev_right_in_ear = right_in_ear;
     mc->prev_state_valid = true;
 
+    /* Link loss invalidates wear state but deliberately retains the players
+     * paused for a removal cycle.  A fresh first report that says "worn"
+     * completes that cycle without relying on stale sensor values. */
+    if (!previous_state_valid && action == WEAR_POLICY_ACTION_NONE &&
+        !wear_policy_blocks_playback(mc->ear_pause_mode,
+                                     true,
+                                     left_in_ear,
+                                     right_in_ear) &&
+        (mc->ear_paused_players != NULL ||
+         g_hash_table_size(mc->ear_pending_pauses) > 0)) {
+        action = WEAR_POLICY_ACTION_RESUME;
+    }
+
     /* Execute actions */
     if (action == WEAR_POLICY_ACTION_PAUSE) {
-        g_message("Ear detection: pods removed, pausing media");
-        media_control_pause_all(mc);
+        if (mc->airpods_audio_active) {
+            g_message("Ear detection: pods removed, pausing media");
+            media_control_pause_all(mc);
+        } else {
+            g_debug("AirPods are not the confirmed Linux audio source; leaving speaker media untouched");
+        }
     } else if (action == WEAR_POLICY_ACTION_RESUME) {
         g_message("Ear detection: pods inserted, resuming media");
         media_control_resume(mc);
@@ -836,13 +937,13 @@ static void pause_all_into(MediaControl *mc,
 
 void media_control_pause_all(MediaControl *mc)
 {
-    if (mc != NULL)
+    if (mc != NULL && mc->airpods_link_active && mc->airpods_audio_active)
         pause_all_into(mc, MPRIS_ACTION_PAUSE_FOR_EAR, true);
 }
 
 void media_control_pause_all_for_handoff(MediaControl *mc)
 {
-    if (mc != NULL)
+    if (mc != NULL && mc->airpods_link_active)
         pause_all_into(mc, MPRIS_ACTION_PAUSE_FOR_HANDOFF, true);
 }
 
@@ -864,7 +965,7 @@ void media_control_clear_handoff_pause(MediaControl *mc)
 
 bool media_control_wear_state_blocks_playback(MediaControl *mc)
 {
-    if (mc == NULL)
+    if (mc == NULL || !mc->airpods_link_active)
         return false;
 
     return wear_policy_blocks_playback(mc->ear_pause_mode,
@@ -873,24 +974,23 @@ bool media_control_wear_state_blocks_playback(MediaControl *mc)
                                        mc->prev_right_in_ear);
 }
 
+bool media_control_can_claim_or_route_audio(MediaControl *mc)
+{
+    return mc != NULL &&
+           mc->airpods_link_active &&
+           mc->prev_state_valid &&
+           (mc->prev_left_in_ear || mc->prev_right_in_ear);
+}
+
 bool media_control_reclaim_audio(MediaControl *mc, const char *device_address)
 {
-    if (mc == NULL)
+    if (!media_control_can_claim_or_route_audio(mc))
         return false;
 
     /* Reuse the bounded, cancellable A2DP route selector.  The old reclaim
      * path synchronously ran pactl twice and slept on the GLib main thread;
      * it could also suspend a headset-profile sink. */
     return audio_route_start(mc->audio_route, device_address);
-}
-
-void media_control_route_audio_to_device(MediaControl *mc,
-                                         const char *device_address)
-{
-    if (mc == NULL)
-        return;
-
-    (void)audio_route_start(mc->audio_route, device_address);
 }
 
 void media_control_cancel_audio_route(MediaControl *mc)

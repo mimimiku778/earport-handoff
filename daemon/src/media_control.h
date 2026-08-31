@@ -43,6 +43,17 @@ void media_control_set_playback_stopped_callback(MediaControl *mc,
                                                  MediaPlaybackStoppedCallback callback,
                                                  void *user_data);
 
+/* Mark whether the current AirPods AAP control link is usable.  Wear state
+ * is scoped to one live control session and is invalidated on link loss, so
+ * an off-head value from a disconnected device can never gate speaker
+ * playback.  Ear-pause ownership is retained for a removal/reconnect cycle. */
+void media_control_set_airpods_link_active(MediaControl *mc, bool active);
+
+/* Mark whether AirPods have positively reported Linux as their current audio
+ * source.  A live control link alone is not enough to pause desktop media:
+ * the user may be listening through speakers while an Apple host owns them. */
+void media_control_set_airpods_audio_active(MediaControl *mc, bool active);
+
 /* Forget per-device edge and resume tracking when switching AirPods. */
 void media_control_reset_device_state(MediaControl *mc);
 
@@ -68,14 +79,14 @@ bool media_control_is_playing(MediaControl *mc);
  * ear-pause mode. Unknown state and disabled ear-pause return false. */
 bool media_control_wear_state_blocks_playback(MediaControl *mc);
 
+/* Whether ownership may be claimed and audio routed to the current AirPods.
+ * Unlike speaker-pause policy, this fails closed until a fresh wear report
+ * says at least one side is worn on the live AAP link. */
+bool media_control_can_claim_or_route_audio(MediaControl *mc);
+
 /* Asynchronously select the device's A2DP sink after claiming AudioSource
  * ownership. Returns whether a bounded route attempt was accepted. */
 bool media_control_reclaim_audio(MediaControl *mc, const char *device_address);
-
-/* Briefly accelerate PipeWire/PulseAudio routing after a BlueZ connection.
- * The attempt is asynchronous and supersedes any older device attempt. */
-void media_control_route_audio_to_device(MediaControl *mc,
-                                         const char *device_address);
 
 /* Cancel a pending audio-route attempt (normally on disconnect/switch). */
 void media_control_cancel_audio_route(MediaControl *mc);

@@ -161,6 +161,7 @@ build_daemon() {
     fi
 
     meson setup "$DAEMON_BUILD_DIR" "$SCRIPT_DIR/daemon" \
+        --buildtype=release \
         --prefix="$INSTALL_PREFIX" \
         --datadir="$USER_DATA_HOME"
     ninja -C "$DAEMON_BUILD_DIR"
