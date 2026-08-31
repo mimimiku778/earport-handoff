@@ -677,7 +677,12 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
             if (app.media_control != NULL) {
                 media_control_set_airpods_audio_active(app.media_control,
                                                        false);
-                media_control_restore_audio_route(app.media_control);
+                /* Keep the AirPods sink selected while another host owns the
+                 * transport. Restoring speakers here leaks the first part of
+                 * an explicit Linux restart before A2DP is reclaimed. A real
+                 * BlueZ disconnect/removal still restores the saved output. */
+                if (!app.config.handoff_enabled)
+                    media_control_restore_audio_route(app.media_control);
             }
             app.last_audio_claim_time = 0;
         } else if (source->type != AAP_AUDIO_SOURCE_NONE && local_source) {
@@ -734,7 +739,9 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         }
         if (app.media_control != NULL) {
             media_control_set_airpods_audio_active(app.media_control, false);
-            media_control_restore_audio_route(app.media_control);
+            /* Hold the selected AirPods route while yielding. This keeps a
+             * user-initiated Linux restart silent until ownership and A2DP
+             * are ready instead of briefly playing through speakers. */
         }
         break;
     }
