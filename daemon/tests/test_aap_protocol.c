@@ -61,6 +61,69 @@ static void test_owns_connection_command(void)
     g_assert_cmpint(memcmp(command, expected_release, sizeof(command)), ==, 0);
 }
 
+static void test_initialization_ack_sequence(void)
+{
+    const uint8_t handshake_ack[] = {
+        0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    };
+    const uint8_t features_ack[] = {
+        0x04, 0x00, 0x04, 0x00, 0x2B, 0x00, 0x01,
+    };
+    AapInitState state;
+
+    aap_init_state_reset(&state);
+
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         handshake_ack,
+                                         sizeof(handshake_ack)),
+                    ==, AAP_INIT_ACTION_SEND_FEATURES);
+
+    /* A failed write may be retried when the device repeats its ACK. */
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         handshake_ack,
+                                         sizeof(handshake_ack)),
+                    ==, AAP_INIT_ACTION_SEND_FEATURES);
+
+    aap_init_mark_action_sent(&state, AAP_INIT_ACTION_SEND_FEATURES);
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         handshake_ack,
+                                         sizeof(handshake_ack)),
+                    ==, AAP_INIT_ACTION_NONE);
+
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         features_ack,
+                                         sizeof(features_ack)),
+                    ==, AAP_INIT_ACTION_REQUEST_NOTIFICATIONS);
+    aap_init_mark_action_sent(&state,
+                              AAP_INIT_ACTION_REQUEST_NOTIFICATIONS);
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         features_ack,
+                                         sizeof(features_ack)),
+                    ==, AAP_INIT_ACTION_NONE);
+}
+
+static void test_initialization_rejects_unrelated_and_short_packets(void)
+{
+    const uint8_t short_handshake_ack[] = {0x01, 0x00, 0x04};
+    const uint8_t ordinary_packet[] = {
+        0x04, 0x00, 0x04, 0x00, AAP_OPCODE_EAR_DETECTION, 0x00,
+        AAP_EAR_OUT, AAP_EAR_OUT,
+    };
+    AapInitState state;
+
+    aap_init_state_reset(&state);
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         short_handshake_ack,
+                                         sizeof(short_handshake_ack)),
+                    ==, AAP_INIT_ACTION_NONE);
+    g_assert_cmpint(aap_init_next_action(&state,
+                                         ordinary_packet,
+                                         sizeof(ordinary_packet)),
+                    ==, AAP_INIT_ACTION_NONE);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -69,5 +132,9 @@ int main(int argc, char **argv)
                     test_audio_source_rejects_bad_packets);
     g_test_add_func("/aap/owns-connection/build",
                     test_owns_connection_command);
+    g_test_add_func("/aap/initialization/ack-sequence",
+                    test_initialization_ack_sequence);
+    g_test_add_func("/aap/initialization/reject-unrelated",
+                    test_initialization_rejects_unrelated_and_short_packets);
     return g_test_run();
 }

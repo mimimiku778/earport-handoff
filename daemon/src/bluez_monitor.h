@@ -11,6 +11,7 @@
 #include <glib.h>
 #include <gio/gio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /* BlueZ D-Bus constants */
 #define BLUEZ_SERVICE           "org.bluez"
@@ -26,6 +27,8 @@ typedef struct {
     char *object_path;
     bool connected;
     bool paired;
+    uint16_t vendor_id;
+    uint16_t product_id;
 } BluezDeviceInfo;
 
 /* Callback types */
@@ -72,6 +75,9 @@ void bluez_monitor_set_connected_callback(BluezMonitor *monitor,
 void bluez_monitor_set_disconnected_callback(BluezMonitor *monitor,
                                               BluezDeviceCallback callback,
                                               void *user_data);
+
+/** Enable continuous LE discovery and connect-on-confirmed-wear handling. */
+void bluez_monitor_set_auto_connect_on_wear(BluezMonitor *monitor, bool enabled);
 
 /**
  * Check for already connected AirPods devices

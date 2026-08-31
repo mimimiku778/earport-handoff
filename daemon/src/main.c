@@ -40,6 +40,13 @@ typedef struct {
     int reconnect_attempts;
     bool bluez_connected;   /* Device still connected at BlueZ level */
 
+    /* AAP initialization is ACK-driven. Newer AirPods can take about a
+     * second to finish feature negotiation, so an eager notification request
+     * is silently ignored. */
+    AapInitState aap_init;
+    guint notification_retry_timeout_id;
+    bool notifications_healthy;
+
     /* Seamless audio-source handoff state. AudioSource addresses use the
      * same byte order as bdaddr_t, not the printable Bluetooth address. */
     uint8_t local_audio_source_address[6];
@@ -55,6 +62,7 @@ typedef struct {
 #define RECONNECT_MAX_ATTEMPTS 5
 #define RECONNECT_BASE_DELAY_SEC 2
 #define AUDIO_CLAIM_DEBOUNCE_USEC (500 * 1000)
+#define NOTIFICATION_RETRY_DELAY_MSEC 2000
 
 static AppContext app = {0};
 
@@ -66,6 +74,82 @@ static gboolean apply_saved_settings_idle(gpointer user_data);
 static void schedule_reconnect(void);
 static void cancel_reconnect(void);
 static void on_media_playback_started(void *user_data);
+
+static void cancel_notification_retry(void)
+{
+    if (app.notification_retry_timeout_id > 0) {
+        g_source_remove(app.notification_retry_timeout_id);
+        app.notification_retry_timeout_id = 0;
+    }
+}
+
+static void reset_aap_initialization(void)
+{
+    cancel_notification_retry();
+    aap_init_state_reset(&app.aap_init);
+    app.notifications_healthy = false;
+}
+
+static gboolean retry_notifications_timeout_cb(gpointer user_data)
+{
+    (void)user_data;
+    app.notification_retry_timeout_id = 0;
+
+    if (app.notifications_healthy || app.bt_conn == NULL ||
+        !bt_connection_is_connected(app.bt_conn)) {
+        return G_SOURCE_REMOVE;
+    }
+
+    g_message("No battery or wear notification after AAP setup; retrying notification request once");
+    if (!bt_connection_send_request_notifications(app.bt_conn))
+        g_warning("Failed to retry AirPods notification request");
+
+    return G_SOURCE_REMOVE;
+}
+
+static void mark_notifications_healthy(void)
+{
+    if (app.notifications_healthy)
+        return;
+
+    app.notifications_healthy = true;
+    cancel_notification_retry();
+    g_message("AirPods battery/wear notification stream is active");
+}
+
+static bool handle_aap_initialization_packet(const uint8_t *data, size_t len)
+{
+    AapInitAction action = aap_init_next_action(&app.aap_init, data, len);
+
+    switch (action) {
+    case AAP_INIT_ACTION_SEND_FEATURES:
+        g_message("AirPods handshake acknowledged; sending feature configuration");
+        if (bt_connection_send_set_features(app.bt_conn)) {
+            aap_init_mark_action_sent(&app.aap_init, action);
+        } else {
+            g_warning("Failed to send AirPods feature configuration");
+        }
+        return true;
+
+    case AAP_INIT_ACTION_REQUEST_NOTIFICATIONS:
+        g_message("AirPods feature negotiation acknowledged; requesting notifications");
+        if (bt_connection_send_request_notifications(app.bt_conn)) {
+            aap_init_mark_action_sent(&app.aap_init, action);
+            cancel_notification_retry();
+            app.notification_retry_timeout_id =
+                g_timeout_add(NOTIFICATION_RETRY_DELAY_MSEC,
+                              retry_notifications_timeout_cb,
+                              NULL);
+        } else {
+            g_warning("Failed to request AirPods notifications");
+        }
+        return true;
+
+    case AAP_INIT_ACTION_NONE:
+    default:
+        return false;
+    }
+}
 
 static void reset_audio_handoff_state(void)
 {
@@ -126,6 +210,9 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
 {
     (void)user_data;
 
+    if (handle_aap_initialization_packet(data, len))
+        return;
+
     AapParsedPacket packet;
     AapParseResult result = aap_parse_packet(data, len, &packet);
 
@@ -138,6 +225,7 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
 
     switch (packet.type) {
     case AAP_PKT_TYPE_BATTERY:
+        mark_notifications_healthy();
         g_message("Battery: L=%d%% (status=%d) R=%d%% (status=%d) Case=%d%% (status=%d)",
                   packet.data.battery.left_level,
                   packet.data.battery.left_status,
@@ -167,6 +255,7 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         break;
 
     case AAP_PKT_TYPE_EAR_DETECTION: {
+        mark_notifications_healthy();
         bool primary_in_ear = packet.data.ear_detection.primary_in_ear;
         bool secondary_in_ear = packet.data.ear_detection.secondary_in_ear;
 
@@ -419,6 +508,7 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
     case BT_STATE_CONNECTED:
         g_message("Bluetooth connected, sending handshake...");
         cancel_reconnect();
+        reset_aap_initialization();
 
         app.local_audio_source_address_valid =
             bt_connection_get_local_audio_source_address(
@@ -427,15 +517,12 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
         /* Attach to main loop for data reception */
         bt_connection_attach_to_mainloop(app.bt_conn, NULL);
 
-        /* Send initialization sequence */
+        /* Start initialization. Feature configuration and notification
+         * subscription are sent from on_bt_data_received only after their
+         * corresponding ACKs. */
         g_usleep(100000);  /* 100ms delay */
-        bt_connection_send_handshake(app.bt_conn);
-
-        g_usleep(50000);  /* 50ms delay */
-        bt_connection_send_set_features(app.bt_conn);
-
-        g_usleep(50000);
-        bt_connection_send_request_notifications(app.bt_conn);
+        if (!bt_connection_send_handshake(app.bt_conn))
+            g_warning("Failed to send AirPods handshake");
 
         /* Update state */
         airpods_state_set_device(&app.state,
@@ -464,6 +551,7 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
 
     case BT_STATE_DISCONNECTED:
         g_message("Bluetooth disconnected");
+        reset_aap_initialization();
 
         if (app.state.connected) {
             dbus_service_emit_device_disconnected(app.dbus_service,
@@ -481,6 +569,7 @@ static void on_bt_state_changed(BluetoothState state, const char *error, void *u
 
     case BT_STATE_ERROR:
         g_warning("Bluetooth error: %s", error ? error : "unknown");
+        reset_aap_initialization();
         schedule_reconnect();
         break;
 
@@ -727,6 +816,7 @@ static void on_bluez_device_disconnected(const BluezDeviceInfo *device, void *us
     char *disconnected_address = g_strdup(app.pending_address);
     app.bluez_connected = false;
     cancel_reconnect();
+    reset_aap_initialization();
     disconnect_from_airpods();
 
     reset_audio_handoff_state();
@@ -1038,6 +1128,8 @@ int main(int argc, char *argv[])
 
     bluez_monitor_set_connected_callback(app.bluez_monitor, on_bluez_device_connected, NULL);
     bluez_monitor_set_disconnected_callback(app.bluez_monitor, on_bluez_device_disconnected, NULL);
+    bluez_monitor_set_auto_connect_on_wear(app.bluez_monitor,
+                                           app.config.auto_connect_on_wear);
 
     if (!bluez_monitor_start(app.bluez_monitor)) {
         g_error("Failed to start BlueZ monitor");

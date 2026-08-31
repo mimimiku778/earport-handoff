@@ -69,10 +69,41 @@
 #define AAP_CONTROL_CMD_SIZE     11
 #define AAP_MIN_BATTERY_SIZE     12
 
+/* AAP connection-initialization packets do not all use the regular packet
+ * parser.  Keep their small state machine here so ordering and duplicate ACK
+ * handling can be tested without a live Bluetooth socket. */
+typedef enum {
+    AAP_INIT_ACTION_NONE,
+    AAP_INIT_ACTION_SEND_FEATURES,
+    AAP_INIT_ACTION_REQUEST_NOTIFICATIONS,
+} AapInitAction;
+
+typedef struct {
+    bool features_sent;
+    bool notifications_requested;
+} AapInitState;
+
 /* Pre-built packets */
 extern const uint8_t AAP_PKT_HANDSHAKE[AAP_HANDSHAKE_SIZE];
 extern const uint8_t AAP_PKT_REQUEST_NOTIFICATIONS[AAP_REQUEST_NOTIF_SIZE];
 extern const uint8_t AAP_PKT_SET_FEATURES[AAP_SET_FEATURES_SIZE];
+
+/** Reset the per-L2CAP-session initialization state. */
+void aap_init_state_reset(AapInitState *state);
+
+/**
+ * Return the next initialization action implied by an incoming packet.
+ *
+ * A duplicate ACK returns the same action until the caller confirms a
+ * successful send with aap_init_mark_action_sent().  Once confirmed, later
+ * duplicate ACKs are harmless no-ops.
+ */
+AapInitAction aap_init_next_action(const AapInitState *state,
+                                   const uint8_t *data,
+                                   size_t len);
+
+/** Record that an initialization action was successfully written. */
+void aap_init_mark_action_sent(AapInitState *state, AapInitAction action);
 
 extern const uint8_t AAP_PKT_NC_OFF[AAP_CONTROL_CMD_SIZE];
 extern const uint8_t AAP_PKT_NC_ANC[AAP_CONTROL_CMD_SIZE];

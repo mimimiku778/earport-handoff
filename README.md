@@ -12,6 +12,7 @@ This is a GPL-licensed fork of [Anoryth/EarPort](https://github.com/Anoryth/earp
 - parsing of AAP `AudioSource` notifications;
 - Linux audio ownership requests through AAP `OwnsConnection`;
 - MPRIS pause/resume coordination when audio ownership changes;
+- wear-triggered connection from a disconnected state for AirPods 4, AirPods 4 with ANC, and AirPods Max 2 using BLE advertisements and BlueZ;
 - safe selection between multiple connected AirPods while maintaining only one AAP control session.
 
 The handoff path is built into the EarPort daemon. Battery, ANC, wear detection, and handoff therefore share one Apple Accessory Protocol (AAP) L2CAP connection instead of competing for the same private Bluetooth service.
@@ -29,7 +30,7 @@ This fork combines code and research from separate projects, with their roles ke
 |---|---|---|
 | [Anoryth/EarPort](https://github.com/Anoryth/earport) | Application base: C daemon, GNOME extension, D-Bus API, battery/noise/wear handling, and MPRIS integration | This repository is a modified fork and retains its GPL-3.0-or-later history and notices. |
 | [LibrePods](https://github.com/librepods-org/librepods) | GPL-licensed AAP documentation and implementation knowledge, including `AudioSource` and `OwnsConnection` semantics | The new protocol handling is an integrated GPL implementation informed by LibrePods. |
-| [CAPod](https://github.com/d4rken-org/capod) | Cross-checking the AirPods Max 2 model number, protocol identifier, and feature classification | CAPod is GPL-licensed. Its Max 2 information was used as a cross-check; its BLE wear-detection heuristic is not used here because EarPort consumes connected AAP events. |
+| [CAPod](https://github.com/d4rken-org/capod) | Cross-checking AirPods 4/Max 2 BLE model identifiers, public advertisement layout, and Max 2 wear bits | CAPod is GPL-licensed. The disconnected-wear detector adapts this published protocol knowledge to BlueZ; connected wear handling still uses EarPort's AAP events. |
 | [xatuke/handoff](https://github.com/xatuke/handoff) | Behavioral inspiration for Apple/Linux ownership switching | No source code was copied. That repository had no license file when this fork was prepared, so this project does not assign it a license or incorporate its code. |
 
 See [CREDITS](CREDITS) for full acknowledgements.
@@ -41,20 +42,23 @@ flowchart LR
     UI[GNOME Quick Settings] <-->|D-Bus| D[earport-daemon]
     M[MPRIS media players] <-->|playback events<br/>pause and resume| D
     P[PipeWire / PulseAudio] <-->|pactl sink refresh| D
-    Z[BlueZ Device1 events] --> D
+    Z[BlueZ Device1 events<br/>and LE advertisements] --> D
+    D -->|Device1.Connect on<br/>confirmed nearby wear| Z
     D <-->|one unprivileged<br/>AAP L2CAP session| A[Connected AirPods]
     A -->|battery, noise mode,<br/>wear and AudioSource events| D
 ```
 
 The daemon follows this sequence:
 
-1. BlueZ reports a paired AirPods device as connected.
-2. EarPort opens one unprivileged L2CAP `SOCK_SEQPACKET` connection to the AirPods AAP service on PSM `0x1001`, performs the handshake, and subscribes to notifications.
-3. The daemon gets the Bluetooth adapter address selected for that exact socket and uses it to distinguish Linux from another `AudioSource` device.
-4. When an MPRIS player enters `Playing`, EarPort sends an AAP `OwnsConnection` claim. It then briefly cycles the matching BlueZ audio sink through `pactl` so PipeWire/PulseAudio reopens the stream after ownership changes.
-5. If AAP reports that another device took the media source, EarPort pauses currently playing MPRIS players and remembers only the players it paused.
-6. When that source releases the AirPods, EarPort resumes those players. Resume is deferred if the current wear state says the AirPods are off-head/out-of-ear.
-7. A call source on another device is treated specially: Linux does not claim over it and waits for the call to release the AirPods.
+1. While enabled, EarPort owns a BlueZ LE discovery session and watches Apple company (`0x004c`) Proximity Pairing advertisements.
+2. After seeing an unworn baseline on the same rotating advertisement object, two nearby worn/in-ear advertisements within two seconds trigger an asynchronous `Device1.Connect()` call. AirPods 4 requires both buds to report in-ear; Max 2 accepts either cup sensor. The BLE model must map to exactly one disconnected paired AirPods device, and a 30-second cooldown suppresses reconnect loops.
+3. BlueZ reports the paired AirPods device as connected.
+4. EarPort opens one unprivileged L2CAP `SOCK_SEQPACKET` connection to the AirPods AAP service on PSM `0x1001`, performs the handshake, and subscribes to notifications.
+5. The daemon gets the Bluetooth adapter address selected for that exact socket and uses it to distinguish Linux from another `AudioSource` device.
+6. When an MPRIS player enters `Playing`, EarPort sends an AAP `OwnsConnection` claim. It then briefly cycles the matching BlueZ audio sink through `pactl` so PipeWire/PulseAudio reopens the stream after ownership changes.
+7. If AAP reports that another device took the media source, EarPort pauses currently playing MPRIS players and remembers only the players it paused.
+8. When that source releases the AirPods, EarPort resumes those players. Resume is deferred if the current wear state says the AirPods are off-head/out-of-ear.
+9. A call source on another device is treated specially: Linux does not claim over it and waits for the call to release the AirPods.
 
 Wear detection controls media, not the Bluetooth link. Removing the headphones
 normally leaves them connected to Linux so EarPort can keep receiving AAP
@@ -98,11 +102,11 @@ Max 2 intentionally does not reuse the first-generation Max workaround that mirr
 The current code has passed:
 
 - a clean Meson debug build with warnings treated as errors;
-- four Meson test groups: model/configuration, AAP packet handling, two-device connection policy, and wear policy;
+- five Meson test groups: model/configuration, AAP packet handling, two-device connection policy, connected wear policy, and disconnected BLE wear auto-connect;
 - AddressSanitizer and UndefinedBehaviorSanitizer builds/tests;
 - the GitHub Actions build, unit-test, and installer syntax checks.
 
-These tests verify packet parsing and command bytes, Max 2 and AirPods 4 model mapping, capability selection, handoff defaults, device-switch decisions, and wear-policy transitions. They cannot prove behavior against every AirPods firmware or Apple device.
+These tests verify packet parsing and command bytes, Max 2 and AirPods 4 model mapping, capability selection, handoff defaults, device-switch decisions, connected wear-policy transitions, and BLE auto-connect confirmation/rearm behavior. They cannot prove behavior against every AirPods firmware or Apple device.
 
 ### Physical verification
 
@@ -115,7 +119,7 @@ The reference system was:
 
 | Device | Observed on real hardware |
 |---|---|
-| **AirPods Max 2** | Re-pairing after the BlueZ `DeviceID` change; unprivileged L2CAP connection; AAP metadata `A3454` and model classification; battery notification; ANC state; distinct two-slot AAP wear `IN`/`OUT` events; Chromium pausing through MPRIS after an off-head transition; local Linux `AudioSource` ownership claim. |
+| **AirPods Max 2** | Re-pairing after the BlueZ `DeviceID` change; unprivileged L2CAP connection; AAP metadata `A3454` and model classification; battery notification; ANC state; distinct two-slot AAP wear `IN`/`OUT` events; Chromium pausing through MPRIS after an off-head transition; local Linux `AudioSource` ownership claim; and a real disconnected, off-head-to-worn BLE transition causing an automatic BlueZ connection followed by a successful AAP session. |
 | **AirPods 4 with ANC** | AAP metadata `A3056` and model classification; BlueZ product ID `0x201B`; battery notifications for left/right buds; ANC state; `IN`/`IN` wear event; local `AudioSource` transition from `NONE` to `MEDIA (Linux)`. |
 
 The Max 2 wear sensors can be fooled by holding or gripping the ear cups: AAP may report `IN` even when the headphones are not on a head. EarPort can only act on the state reported by the hardware, so off-head behavior is not guaranteed while the cups are being handled. The observed physical result was a correct MPRIS pause on an ordinary removal transition.
@@ -124,6 +128,7 @@ The Max 2 wear sensors can be fooled by holding or gripping the ear cups: AAP ma
 
 - End-to-end automatic routing from Linux to an iPhone, iPad, or Mac and back while the AirPods are worn.
 - Remote `CALL` ownership against a real Apple-device call.
+- Disconnected-wear auto-connect on AirPods 4 or AirPods 4 with ANC hardware.
 - Plain AirPods 4 hardware.
 - All inherited AirPods generations and all firmware versions.
 
@@ -211,6 +216,7 @@ Handoff is enabled by default in `~/.config/earport/daemon.conf`:
 [Settings]
 ear_pause_mode=1
 handoff_enabled=true
+auto_connect_on_wear=true
 ```
 
 The wear-pause modes are:
@@ -226,6 +232,9 @@ To keep upstream EarPort features but disable audio-source ownership, set `hando
 ```bash
 systemctl --user restart earport-daemon.service
 ```
+
+Set `auto_connect_on_wear=false` to stop continuous LE discovery and disable
+connection attempts initiated by disconnected wear advertisements.
 
 ## Checking the installation
 
@@ -258,7 +267,10 @@ Logs and D-Bus output may contain Bluetooth addresses. Redact them before postin
 
 ## Current limitations
 
-- A normal Bluetooth connection to Linux must already exist. Starting playback does not connect an otherwise disconnected pair solely for handoff.
+- Playback-triggered handoff requires an existing Linux Bluetooth connection; starting playback alone does not connect a disconnected pair. The separate wear-triggered path can connect supported models after an unworn-to-worn transition.
+- Wear-triggered connection uses a conservative model-and-proximity heuristic because AirPods advertise with a rotating private BLE address. It supports AirPods 4, AirPods 4 with ANC, and AirPods Max 2; requires a same-object unworn baseline, RSSI of at least `-70 dBm`, two worn observations, and exactly one paired device with the matching model. AirPods 4 requires both buds to be in-ear. It refuses ambiguous same-model pairings, but a nearby third-party pair of the same model could still trigger a connection attempt to your paired device.
+- Deep AirPods power-saving states may stop or delay the changing BLE wear advertisement. In that state, merely putting Max 2 on may wake neither Linux nor an iPhone; pressing a hardware button can be required before any host can observe the transition. The daemon cannot connect until the hardware advertises again.
+- Continuous LE discovery uses additional Bluetooth radio time and may modestly affect power consumption.
 - Handoff playback detection is MPRIS-based. Chromium, Spotify, and common desktop players normally expose MPRIS; games and other direct audio clients may not trigger a claim.
 - Wear-based playback blocking is also MPRIS-based. It cannot forcibly stop a non-MPRIS application from sending audio to an already connected sink.
 - Wear state is unknown until the first AAP wear notification after a connection. The daemon deliberately allows playback while the state is unknown, avoiding a permanent lockout on models or firmware that do not send that notification.

@@ -37,6 +37,7 @@ sources = files(
     'src/media_control.c',
     'src/wear_policy.c',
     'src/connection_policy.c',
+    'src/ble_autoconnect.c',
 )
 
 # Build executable
@@ -78,6 +79,14 @@ test_wear_policy = executable(
     dependencies: [glib_dep],
 )
 test('wear-policy', test_wear_policy)
+
+test_ble_autoconnect = executable(
+    'test-ble-autoconnect',
+    files('tests/test_ble_autoconnect.c', 'src/ble_autoconnect.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('ble-autoconnect', test_ble_autoconnect)
 
 # Generate launcher files with the configured install prefix.  This keeps a
 # user-local install (the default used by install.sh) self-contained instead

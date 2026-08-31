@@ -22,6 +22,75 @@ const uint8_t AAP_PKT_SET_FEATURES[AAP_SET_FEATURES_SIZE] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
+/* LibrePods names these the handshake and features ACK prefixes.  The first
+ * deliberately has a non-standard AAP header; the latter is the device's
+ * readiness response after feature negotiation. */
+static const uint8_t AAP_HANDSHAKE_ACK_PREFIX[] = {
+    0x01, 0x00, 0x04, 0x00
+};
+
+static const uint8_t AAP_FEATURES_ACK_PREFIX[] = {
+    0x04, 0x00, 0x04, 0x00, 0x2B, 0x00
+};
+
+static bool packet_has_prefix(const uint8_t *data,
+                              size_t len,
+                              const uint8_t *prefix,
+                              size_t prefix_len)
+{
+    return data != NULL && len >= prefix_len &&
+           memcmp(data, prefix, prefix_len) == 0;
+}
+
+void aap_init_state_reset(AapInitState *state)
+{
+    if (state != NULL)
+        memset(state, 0, sizeof(*state));
+}
+
+AapInitAction aap_init_next_action(const AapInitState *state,
+                                   const uint8_t *data,
+                                   size_t len)
+{
+    if (state == NULL)
+        return AAP_INIT_ACTION_NONE;
+
+    if (packet_has_prefix(data, len,
+                          AAP_HANDSHAKE_ACK_PREFIX,
+                          sizeof(AAP_HANDSHAKE_ACK_PREFIX))) {
+        return state->features_sent ? AAP_INIT_ACTION_NONE
+                                    : AAP_INIT_ACTION_SEND_FEATURES;
+    }
+
+    if (packet_has_prefix(data, len,
+                          AAP_FEATURES_ACK_PREFIX,
+                          sizeof(AAP_FEATURES_ACK_PREFIX))) {
+        return state->notifications_requested
+                   ? AAP_INIT_ACTION_NONE
+                   : AAP_INIT_ACTION_REQUEST_NOTIFICATIONS;
+    }
+
+    return AAP_INIT_ACTION_NONE;
+}
+
+void aap_init_mark_action_sent(AapInitState *state, AapInitAction action)
+{
+    if (state == NULL)
+        return;
+
+    switch (action) {
+    case AAP_INIT_ACTION_SEND_FEATURES:
+        state->features_sent = true;
+        break;
+    case AAP_INIT_ACTION_REQUEST_NOTIFICATIONS:
+        state->notifications_requested = true;
+        break;
+    case AAP_INIT_ACTION_NONE:
+    default:
+        break;
+    }
+}
+
 const uint8_t AAP_PKT_NC_OFF[AAP_CONTROL_CMD_SIZE] = {
     0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0D, 0x01, 0x00, 0x00, 0x00
 };

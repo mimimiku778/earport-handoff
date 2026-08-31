@@ -51,6 +51,7 @@ static void test_handoff_default(void)
     EarPortConfig config;
     config_get_defaults(&config);
     g_assert_true(config.handoff_enabled);
+    g_assert_true(config.auto_connect_on_wear);
 }
 
 int main(int argc, char **argv)

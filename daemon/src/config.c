@@ -98,6 +98,7 @@ void config_get_defaults(EarPortConfig *config)
 {
     config->ear_pause_mode = 1;  /* EAR_PAUSE_ONE_OUT */
     config->handoff_enabled = true;
+    config->auto_connect_on_wear = true;
 }
 
 bool config_load(EarPortConfig *config)
@@ -141,9 +142,15 @@ bool config_load(EarPortConfig *config)
             keyfile, CONFIG_GROUP, "handoff_enabled", NULL);
     }
 
-    g_message("Config loaded: ear_pause_mode=%d, handoff_enabled=%s",
+    if (g_key_file_has_key(keyfile, CONFIG_GROUP, "auto_connect_on_wear", NULL)) {
+        config->auto_connect_on_wear = g_key_file_get_boolean(
+            keyfile, CONFIG_GROUP, "auto_connect_on_wear", NULL);
+    }
+
+    g_message("Config loaded: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s",
               config->ear_pause_mode,
-              config->handoff_enabled ? "true" : "false");
+              config->handoff_enabled ? "true" : "false",
+              config->auto_connect_on_wear ? "true" : "false");
 
     g_key_file_free(keyfile);
     g_free(config_path);
@@ -161,12 +168,15 @@ bool config_save(const EarPortConfig *config)
     /* Write settings */
     g_key_file_set_integer(keyfile, CONFIG_GROUP, "ear_pause_mode", config->ear_pause_mode);
     g_key_file_set_boolean(keyfile, CONFIG_GROUP, "handoff_enabled", config->handoff_enabled);
+    g_key_file_set_boolean(keyfile, CONFIG_GROUP, "auto_connect_on_wear",
+                           config->auto_connect_on_wear);
 
     /* Add comment */
     g_key_file_set_comment(keyfile, CONFIG_GROUP, NULL,
                            "EarPort daemon configuration\n"
                            "ear_pause_mode: 0=disabled, 1=pause when one removed, 2=pause when both removed\n"
-                           "handoff_enabled: claim AirPods audio when Linux playback starts",
+                           "handoff_enabled: claim AirPods audio when Linux playback starts\n"
+                           "auto_connect_on_wear: scan BLE and connect a uniquely matched paired AirPods device when worn",
                            NULL);
 
     gchar *config_path = get_config_path();
@@ -180,9 +190,10 @@ bool config_save(const EarPortConfig *config)
         return false;
     }
 
-    g_message("Config saved: ear_pause_mode=%d, handoff_enabled=%s",
+    g_message("Config saved: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s",
               config->ear_pause_mode,
-              config->handoff_enabled ? "true" : "false");
+              config->handoff_enabled ? "true" : "false",
+              config->auto_connect_on_wear ? "true" : "false");
 
     g_key_file_free(keyfile);
     g_free(config_path);
