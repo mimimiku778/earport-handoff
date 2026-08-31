@@ -35,6 +35,7 @@ sources = files(
     'src/config.c',
     'src/dbus_service.c',
     'src/media_control.c',
+    'src/wear_policy.c',
     'src/connection_policy.c',
 )
 
@@ -69,6 +70,14 @@ test_connection_policy = executable(
     dependencies: [glib_dep],
 )
 test('connection-policy', test_connection_policy)
+
+test_wear_policy = executable(
+    'test-wear-policy',
+    files('tests/test_wear_policy.c', 'src/wear_policy.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('wear-policy', test_wear_policy)
 
 # Generate launcher files with the configured install prefix.  This keeps a
 # user-local install (the default used by install.sh) self-contained instead

@@ -83,14 +83,20 @@ static bool audio_source_is_local(const AapAudioSourceData *source)
                   sizeof(source->device_address)) == 0;
 }
 
-static void claim_audio_for_linux(bool restart_sink)
+static bool claim_audio_for_linux(bool restart_sink)
 {
     if (!app.config.handoff_enabled)
-        return;
+        return false;
+
+    if (app.media_control != NULL &&
+        media_control_wear_state_blocks_playback(app.media_control)) {
+        g_debug("Cannot claim AirPods audio ownership while they are not worn");
+        return false;
+    }
 
     if (app.bt_conn == NULL || !bt_connection_is_connected(app.bt_conn)) {
         g_debug("Cannot claim AirPods audio ownership: AAP is disconnected");
-        return;
+        return false;
     }
 
     uint8_t command[AAP_CONTROL_CMD_SIZE];
@@ -98,7 +104,7 @@ static void claim_audio_for_linux(bool restart_sink)
     if (bt_connection_send(app.bt_conn, command, sizeof(command)) !=
         (ssize_t)sizeof(command)) {
         g_warning("Failed to send AirPods audio ownership claim");
-        return;
+        return false;
     }
 
     g_message("Claimed AirPods audio ownership for Linux");
@@ -109,6 +115,7 @@ static void claim_audio_for_linux(bool restart_sink)
                                 : app.pending_address;
         media_control_reclaim_audio(app.media_control, address);
     }
+    return true;
 }
 
 /* ============================================================================
@@ -216,23 +223,31 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         } else if (source->type == AAP_AUDIO_SOURCE_NONE) {
             if (app.reclaim_when_audio_released) {
                 g_message("Other device released AirPods audio; reclaiming for Linux");
-                MediaHandoffResumeResult resume_result = app.media_control != NULL
-                    ? media_control_resume_handoff(app.media_control)
-                    : MEDIA_HANDOFF_RESUME_NONE;
-
-                if (resume_result == MEDIA_HANDOFF_RESUME_STARTED) {
-                    /* Claim and restart once here. The resulting MPRIS
-                     * Playing signal is suppressed by the short debounce. */
-                    claim_audio_for_linux(true);
-                } else if (resume_result == MEDIA_HANDOFF_RESUME_NONE &&
-                           app.media_control != NULL) {
-                    claim_audio_for_linux(false);
+                if (app.media_control == NULL) {
+                    app.reclaim_when_audio_released = false;
+                } else if (media_control_wear_state_blocks_playback(
+                               app.media_control)) {
+                    /* This does not start playback: it transfers handoff pause
+                     * ownership to ear detection for the later wear event. */
+                    media_control_resume_handoff(app.media_control);
+                    app.reclaim_when_audio_released = false;
+                } else if (!claim_audio_for_linux(false)) {
+                    /* Do not consume handoff pause ownership until the AAP
+                     * claim was actually sent. A later AudioSource update can
+                     * retry without unexpectedly starting media elsewhere. */
+                    if (media_control_has_handoff_paused(app.media_control)) {
+                        g_warning("Could not reclaim AirPods; preserving paused media for retry");
+                    }
+                } else {
+                    /* Claim first, then resume. The resulting MPRIS Playing
+                     * signal is suppressed by the short claim debounce. */
+                    media_control_resume_handoff(app.media_control);
                     const char *address = app.state.device_address != NULL
                                             ? app.state.device_address
                                             : app.pending_address;
                     media_control_reclaim_audio(app.media_control, address);
+                    app.reclaim_when_audio_released = false;
                 }
-                app.reclaim_when_audio_released = false;
             }
         } else if (local_source) {
             /* This may be confirmation of our claim, or the first state sent

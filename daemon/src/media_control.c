@@ -13,6 +13,7 @@
 #define MPRIS_DBUS_PATH "/org/mpris/MediaPlayer2"
 #define MPRIS_PLAYER_INTERFACE "org.mpris.MediaPlayer2.Player"
 #define DBUS_PROPERTIES_INTERFACE "org.freedesktop.DBus.Properties"
+#define MPRIS_CALL_TIMEOUT_MSEC 2000
 
 struct MediaControl {
     GDBusConnection *connection;
@@ -32,6 +33,33 @@ struct MediaControl {
     bool prev_right_in_ear;
     bool prev_state_valid;
 };
+
+static void pause_all_into(MediaControl *mc,
+                           GList **paused_players,
+                           bool preserve_existing);
+
+static bool player_list_contains(GList *players, const gchar *player_name)
+{
+    return g_list_find_custom(players,
+                              player_name,
+                              (GCompareFunc)g_strcmp0) != NULL;
+}
+
+static void player_list_add_unique(GList **players, const gchar *player_name)
+{
+    if (!player_list_contains(*players, player_name))
+        *players = g_list_append(*players, g_strdup(player_name));
+}
+
+static void transfer_player_ownership_unique(GList **destination,
+                                             GList **source)
+{
+    for (GList *l = *source; l != NULL; l = l->next)
+        player_list_add_unique(destination, l->data);
+
+    g_list_free_full(*source, g_free);
+    *source = NULL;
+}
 
 static void on_mpris_properties_changed(GDBusConnection *connection G_GNUC_UNUSED,
                                         const gchar *sender_name G_GNUC_UNUSED,
@@ -53,9 +81,20 @@ static void on_mpris_properties_changed(GDBusConnection *connection G_GNUC_UNUSE
         GVariant *status = g_variant_lookup_value(changed, "PlaybackStatus",
                                                   G_VARIANT_TYPE_STRING);
         if (status != NULL) {
-            if (g_strcmp0(g_variant_get_string(status, NULL), "Playing") == 0 &&
-                mc->playback_started_callback != NULL) {
-                mc->playback_started_callback(mc->playback_started_user_data);
+            if (g_strcmp0(g_variant_get_string(status, NULL), "Playing") == 0) {
+                if (wear_policy_blocks_playback(mc->ear_pause_mode,
+                                                mc->prev_state_valid,
+                                                mc->prev_left_in_ear,
+                                                mc->prev_right_in_ear)) {
+                    /* A player may be restarted repeatedly while the AirPods
+                     * are off-head. Pause it again, retain pause ownership,
+                     * and suppress the handoff callback so Linux does not
+                     * claim the AirPods for inaudible playback. */
+                    g_message("Media started while AirPods are not worn; pausing");
+                    pause_all_into(mc, &mc->ear_paused_players, true);
+                } else if (mc->playback_started_callback != NULL) {
+                    mc->playback_started_callback(mc->playback_started_user_data);
+                }
             }
             g_variant_unref(status);
         }
@@ -83,7 +122,7 @@ static GList *get_mpris_players(MediaControl *mc)
         NULL,
         G_VARIANT_TYPE("(as)"),
         G_DBUS_CALL_FLAGS_NONE,
-        -1,
+        MPRIS_CALL_TIMEOUT_MSEC,
         NULL,
         &error);
 
@@ -123,7 +162,7 @@ static gchar *get_player_playback_status(MediaControl *mc, const gchar *player_n
         g_variant_new("(ss)", MPRIS_PLAYER_INTERFACE, "PlaybackStatus"),
         G_VARIANT_TYPE("(v)"),
         G_DBUS_CALL_FLAGS_NONE,
-        -1,
+        MPRIS_CALL_TIMEOUT_MSEC,
         NULL,
         &error);
 
@@ -155,7 +194,7 @@ static bool player_pause(MediaControl *mc, const gchar *player_name)
         NULL,
         NULL,
         G_DBUS_CALL_FLAGS_NONE,
-        -1,
+        MPRIS_CALL_TIMEOUT_MSEC,
         NULL,
         &error);
 
@@ -182,7 +221,7 @@ static bool player_play(MediaControl *mc, const gchar *player_name)
         NULL,
         NULL,
         G_DBUS_CALL_FLAGS_NONE,
-        -1,
+        MPRIS_CALL_TIMEOUT_MSEC,
         NULL,
         &error);
 
@@ -255,9 +294,25 @@ void media_control_free(MediaControl *mc)
 
 void media_control_set_ear_pause_mode(MediaControl *mc, EarPauseMode mode)
 {
-    if (mc != NULL) {
-        mc->ear_pause_mode = mode;
-        g_message("Ear pause mode set to: %d", mode);
+    if (mc == NULL)
+        return;
+
+    WearPolicyAction action = wear_policy_mode_change(
+        mc->ear_pause_mode,
+        mode,
+        mc->prev_state_valid,
+        mc->prev_left_in_ear,
+        mc->prev_right_in_ear);
+
+    mc->ear_pause_mode = mode;
+    g_message("Ear pause mode set to: %d", mode);
+
+    if (action == WEAR_POLICY_ACTION_PAUSE) {
+        g_message("Ear pause mode now blocks the current wear state; pausing media");
+        media_control_pause_all(mc);
+    } else if (action == WEAR_POLICY_ACTION_RESUME) {
+        g_message("Ear pause mode now allows the current wear state; resuming owned media");
+        media_control_resume(mc);
     }
 }
 
@@ -293,59 +348,17 @@ void media_control_on_ear_detection_changed(MediaControl *mc,
                                             bool left_in_ear,
                                             bool right_in_ear)
 {
-    if (mc == NULL || mc->ear_pause_mode == EAR_PAUSE_DISABLED) {
+    if (mc == NULL) {
         return;
     }
 
-    bool should_pause = false;
-    bool should_resume = false;
-
-    /* Calculate current state based on mode */
-    bool pods_out = false;
-    bool pods_in = false;
-
-    switch (mc->ear_pause_mode) {
-    case EAR_PAUSE_ONE_OUT:
-        /* Pause if at least one pod is removed */
-        pods_out = !left_in_ear || !right_in_ear;
-        pods_in = left_in_ear && right_in_ear;
-        break;
-
-    case EAR_PAUSE_BOTH_OUT:
-        /* Pause only if both pods are removed */
-        pods_out = !left_in_ear && !right_in_ear;
-        pods_in = left_in_ear || right_in_ear;
-        break;
-
-    default:
-        return;
-    }
-
-    /* Detect transitions (edge detection) */
-    if (mc->prev_state_valid) {
-        bool prev_pods_out = false;
-
-        switch (mc->ear_pause_mode) {
-        case EAR_PAUSE_ONE_OUT:
-            prev_pods_out = !mc->prev_left_in_ear || !mc->prev_right_in_ear;
-            break;
-        case EAR_PAUSE_BOTH_OUT:
-            prev_pods_out = !mc->prev_left_in_ear && !mc->prev_right_in_ear;
-            break;
-        default:
-            break;
-        }
-
-        /* Transition from in-ear to out-of-ear: pause */
-        if (!prev_pods_out && pods_out) {
-            should_pause = true;
-        }
-
-        /* Transition from out-of-ear to in-ear: resume */
-        if (prev_pods_out && pods_in) {
-            should_resume = true;
-        }
-    }
+    WearPolicyAction action = wear_policy_transition(
+        mc->ear_pause_mode,
+        mc->prev_state_valid,
+        mc->prev_left_in_ear,
+        mc->prev_right_in_ear,
+        left_in_ear,
+        right_in_ear);
 
     /* Update previous state */
     mc->prev_left_in_ear = left_in_ear;
@@ -353,10 +366,10 @@ void media_control_on_ear_detection_changed(MediaControl *mc,
     mc->prev_state_valid = true;
 
     /* Execute actions */
-    if (should_pause) {
+    if (action == WEAR_POLICY_ACTION_PAUSE) {
         g_message("Ear detection: pods removed, pausing media");
         media_control_pause_all(mc);
-    } else if (should_resume) {
+    } else if (action == WEAR_POLICY_ACTION_RESUME) {
         g_message("Ear detection: pods inserted, resuming media");
         media_control_resume(mc);
     }
@@ -385,14 +398,8 @@ static void pause_all_into(MediaControl *mc,
         gchar *status = get_player_playback_status(mc, player_name);
         if (status != NULL && g_strcmp0(status, "Playing") == 0) {
             /* Pause this player and remember it */
-            if (player_pause(mc, player_name)) {
-                if (g_list_find_custom(*paused_players,
-                                       player_name,
-                                       (GCompareFunc)g_strcmp0) == NULL) {
-                    *paused_players = g_list_append(*paused_players,
-                                                    g_strdup(player_name));
-                }
-            }
+            if (player_pause(mc, player_name))
+                player_list_add_unique(paused_players, player_name);
         }
         g_free(status);
     }
@@ -403,7 +410,7 @@ static void pause_all_into(MediaControl *mc,
 void media_control_pause_all(MediaControl *mc)
 {
     if (mc != NULL)
-        pause_all_into(mc, &mc->ear_paused_players, false);
+        pause_all_into(mc, &mc->ear_paused_players, true);
 }
 
 void media_control_pause_all_for_handoff(MediaControl *mc)
@@ -428,6 +435,17 @@ bool media_control_is_playing(MediaControl *mc)
 
     g_list_free_full(players, g_free);
     return playing;
+}
+
+bool media_control_wear_state_blocks_playback(MediaControl *mc)
+{
+    if (mc == NULL)
+        return false;
+
+    return wear_policy_blocks_playback(mc->ear_pause_mode,
+                                       mc->prev_state_valid,
+                                       mc->prev_left_in_ear,
+                                       mc->prev_right_in_ear);
 }
 
 static gchar *find_bluez_sink(const char *device_address)
@@ -543,7 +561,8 @@ void media_control_resume(MediaControl *mc)
     /* Resume only players that we paused */
     for (GList *l = mc->ear_paused_players; l != NULL; l = l->next) {
         const gchar *player_name = l->data;
-        player_play(mc, player_name);
+        if (!player_list_contains(mc->handoff_paused_players, player_name))
+            player_play(mc, player_name);
     }
 
     /* Clear the paused list */
@@ -573,21 +592,32 @@ MediaHandoffResumeResult media_control_resume_handoff(MediaControl *mc)
     if (!ear_state_allows_resume) {
         /* Preserve pause ownership, but transfer it to the ear-detection
          * reason. The next out->in transition resumes exactly these players. */
-        mc->ear_paused_players = g_list_concat(mc->ear_paused_players,
-                                               mc->handoff_paused_players);
-        mc->handoff_paused_players = NULL;
+        transfer_player_ownership_unique(&mc->ear_paused_players,
+                                         &mc->handoff_paused_players);
         g_message("Deferring handoff resume until AirPods are worn again");
         return MEDIA_HANDOFF_RESUME_DEFERRED_FOR_EAR_STATE;
     }
 
     bool resumed = false;
+    bool deferred_for_other_reason = false;
     for (GList *l = mc->handoff_paused_players; l != NULL; l = l->next) {
-        if (player_play(mc, l->data))
+        if (player_list_contains(mc->ear_paused_players, l->data)) {
+            deferred_for_other_reason = true;
+        } else if (player_play(mc, l->data)) {
             resumed = true;
+        }
     }
 
     g_list_free_full(mc->handoff_paused_players, g_free);
     mc->handoff_paused_players = NULL;
-    return resumed ? MEDIA_HANDOFF_RESUME_STARTED :
-                     MEDIA_HANDOFF_RESUME_NONE;
+    if (resumed)
+        return MEDIA_HANDOFF_RESUME_STARTED;
+    if (deferred_for_other_reason)
+        return MEDIA_HANDOFF_RESUME_DEFERRED_FOR_EAR_STATE;
+    return MEDIA_HANDOFF_RESUME_NONE;
+}
+
+bool media_control_has_handoff_paused(MediaControl *mc)
+{
+    return mc != NULL && mc->handoff_paused_players != NULL;
 }

@@ -11,18 +11,12 @@
 
 #include <glib.h>
 #include <stdbool.h>
+#include "wear_policy.h"
 
 /* Media control context */
 typedef struct MediaControl MediaControl;
 
 typedef void (*MediaPlaybackStartedCallback)(void *user_data);
-
-/* Ear detection mode for auto-pause behavior */
-typedef enum {
-    EAR_PAUSE_DISABLED = 0,    /* Don't pause on ear removal */
-    EAR_PAUSE_ONE_OUT = 1,     /* Pause when one pod is removed */
-    EAR_PAUSE_BOTH_OUT = 2,    /* Pause when both pods are removed */
-} EarPauseMode;
 
 typedef enum {
     MEDIA_HANDOFF_RESUME_NONE,
@@ -64,8 +58,15 @@ void media_control_pause_all_for_handoff(MediaControl *mc);
 /* Resume only players paused for handoff, deferring while AirPods are out. */
 MediaHandoffResumeResult media_control_resume_handoff(MediaControl *mc);
 
+/* Whether at least one player is still owned by the handoff pause reason. */
+bool media_control_has_handoff_paused(MediaControl *mc);
+
 /* Check whether at least one MPRIS player currently reports Playing. */
 bool media_control_is_playing(MediaControl *mc);
+
+/* Whether the latest known wear state forbids playback in the configured
+ * ear-pause mode. Unknown state and disabled ear-pause return false. */
+bool media_control_wear_state_blocks_playback(MediaControl *mc);
 
 /* Restart the AirPods audio sink after claiming AudioSource ownership. */
 bool media_control_reclaim_audio(MediaControl *mc, const char *device_address);
