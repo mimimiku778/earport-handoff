@@ -162,6 +162,12 @@ static gboolean removal_disconnect_timeout_cb(gpointer user_data)
     g_mutex_unlock(&app.state.lock);
 
     if (still_connected && fully_removed && address != NULL) {
+        /* Start restoring the previous output while the BlueZ sink still
+         * exists. The asynchronous router rechecks configured ownership
+         * before writing, so a concurrent manual output choice wins. */
+        if (app.media_control != NULL)
+            media_control_restore_audio_route(app.media_control);
+
         if (bluez_monitor_disconnect_device(
                 app.bluez_monitor,
                 address,
@@ -671,7 +677,7 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
             if (app.media_control != NULL) {
                 media_control_set_airpods_audio_active(app.media_control,
                                                        false);
-                media_control_cancel_audio_route(app.media_control);
+                media_control_restore_audio_route(app.media_control);
             }
             app.last_audio_claim_time = 0;
         } else if (source->type != AAP_AUDIO_SOURCE_NONE && local_source) {
@@ -713,7 +719,7 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
             if (app.media_control != NULL) {
                 media_control_set_airpods_audio_active(app.media_control,
                                                        false);
-                media_control_cancel_audio_route(app.media_control);
+                media_control_restore_audio_route(app.media_control);
             }
             break;
         }
@@ -728,7 +734,7 @@ static void on_bt_data_received(const uint8_t *data, size_t len, void *user_data
         }
         if (app.media_control != NULL) {
             media_control_set_airpods_audio_active(app.media_control, false);
-            media_control_cancel_audio_route(app.media_control);
+            media_control_restore_audio_route(app.media_control);
         }
         break;
     }
@@ -1343,6 +1349,10 @@ static void on_bluez_device_disconnected(const BluezDeviceInfo *device, void *us
         } else {
             media_control_reset_device_state(app.media_control);
         }
+        /* The sink may already be gone after a spontaneous disconnect. The
+         * router checks WirePlumber's configured default, not only its live
+         * fallback, so a stale AirPods preference is still safely removed. */
+        media_control_restore_audio_route(app.media_control);
     }
 
     g_clear_pointer(&app.pending_address, g_free);

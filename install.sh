@@ -109,6 +109,11 @@ check_dependencies() {
         missing_deps+=("ninja")
     fi
 
+    if ! command -v cc &> /dev/null &&
+       ! command -v gcc &> /dev/null; then
+        missing_deps+=("build-essential (C compiler)")
+    fi
+
     # Check pkg-config
     if ! command -v pkg-config &> /dev/null; then
         missing_deps+=("pkg-config")
@@ -144,7 +149,7 @@ check_dependencies() {
         echo "Install them using your package manager:"
         echo ""
         echo "  Ubuntu 26.04 or newer:"
-        echo "    sudo apt install meson ninja-build pkg-config libglib2.0-dev libbluetooth-dev gnome-shell pulseaudio-utils"
+        echo "    sudo apt install build-essential meson ninja-build pkg-config libglib2.0-dev libbluetooth-dev gnome-shell pulseaudio-utils"
         echo ""
         exit 1
     fi

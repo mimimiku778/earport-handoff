@@ -816,7 +816,7 @@ void media_control_set_airpods_link_active(MediaControl *mc, bool active)
          * fresh worn report after reconnect resumes only our own players. */
         mc->prev_state_valid = false;
         mc->airpods_audio_active = false;
-        audio_route_cancel(mc->audio_route);
+        audio_route_restore_previous(mc->audio_route);
     }
 }
 
@@ -835,7 +835,7 @@ void media_control_reset_device_state(MediaControl *mc)
     if (mc == NULL)
         return;
 
-    audio_route_cancel(mc->audio_route);
+    audio_route_restore_previous(mc->audio_route);
 
     /* Invalidate callbacks from the previous AirPods session. Calls already
      * delivered to a player may still finish, but their replies cannot claim
@@ -999,6 +999,14 @@ void media_control_cancel_audio_route(MediaControl *mc)
         return;
 
     audio_route_cancel(mc->audio_route);
+}
+
+void media_control_restore_audio_route(MediaControl *mc)
+{
+    if (mc == NULL)
+        return;
+
+    audio_route_restore_previous(mc->audio_route);
 }
 
 static GPtrArray *dup_pause_targets(GList *paused_players,

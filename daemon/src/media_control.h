@@ -91,6 +91,10 @@ bool media_control_reclaim_audio(MediaControl *mc, const char *device_address);
 /* Cancel a pending audio-route attempt (normally on disconnect/switch). */
 void media_control_cancel_audio_route(MediaControl *mc);
 
+/* Release an EarPort-managed AirPods default and asynchronously restore the
+ * previous non-Bluetooth output, without overriding a later manual choice. */
+void media_control_restore_audio_route(MediaControl *mc);
+
 /* Resume media players that were paused by us */
 void media_control_resume(MediaControl *mc);
 

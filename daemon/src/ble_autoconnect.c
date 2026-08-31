@@ -23,12 +23,15 @@ bool ble_airpods_model_supports_wear_autoconnect(uint16_t model)
 
 static bool model_status_is_worn(uint16_t model, uint8_t status)
 {
-    /* Bits 1 and 3 are the public per-side wear flags on the supported
-     * models. Either side is enough: AirPods 4 must support one-bud use, and
-     * Max 2 may report only one cup bit on some hosts. Case/status bits are
-     * intentionally ignored. */
-    (void)model;
-    return (status & ((1u << 1) | (1u << 3))) != 0;
+    /* Bits 1 and 3 are the public per-side wear flags. Earbuds legitimately
+     * use one side, but a Max sitting against an object can trip one cup's
+     * proximity sensor. Requiring both Max cups prevents that from becoming
+     * a disconnected-BLE auto-connect. Case/status bits are ignored. */
+    const uint8_t wear_mask = (1u << 1) | (1u << 3);
+    if ((AirPodsModel)model == AIRPODS_MODEL_MAX_2)
+        return (status & wear_mask) == wear_mask;
+
+    return (status & wear_mask) != 0;
 }
 
 bool ble_airpods_parse_manufacturer_data(const uint8_t *data,

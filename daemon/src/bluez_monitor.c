@@ -6,6 +6,7 @@
 #include "bluez_monitor.h"
 #include "bluetooth.h"
 #include "ble_autoconnect.h"
+#include "airpods_state.h"
 #include "connection_policy.h"
 
 #include <stdio.h>
@@ -936,9 +937,16 @@ static void process_apple_manufacturer_data(BluezMonitor *monitor,
                              g_strdup(object_path), model_key);
 
         BleAutoConnectState state_before_observation = *state;
+        /* Max cup proximity can be fooled while the headphones are resting
+         * on an object. Never let RSSI collapse its confirmation to one
+         * frame; require repeated two-cup wear reports. AirPods 4 retains the
+         * fast path and one-bud behavior. */
+        bool allow_fast_confirmation =
+            advertisement.model != AIRPODS_MODEL_MAX_2;
         if (!ble_autoconnect_observe(state,
                                      advertisement.worn,
                                      advertisement.worn &&
+                                         allow_fast_confirmation &&
                                          rssi->value >= AUTO_CONNECT_FAST_RSSI_DBM,
                                      now_usec,
                                      AUTO_CONNECT_CONFIRM_WINDOW_USEC,

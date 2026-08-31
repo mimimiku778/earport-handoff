@@ -31,9 +31,14 @@ static void test_parse_max_2(void)
     build_advertisement(AIRPODS_MODEL_MAX_2, 0x22, data);
     g_assert_true(ble_airpods_parse_manufacturer_data(
         data, sizeof(data), &advertisement));
-    g_assert_true(advertisement.worn);
+    g_assert_false(advertisement.worn);
 
     build_advertisement(AIRPODS_MODEL_MAX_2, 0x28, data);
+    g_assert_true(ble_airpods_parse_manufacturer_data(
+        data, sizeof(data), &advertisement));
+    g_assert_false(advertisement.worn);
+
+    build_advertisement(AIRPODS_MODEL_MAX_2, 0x2a, data);
     g_assert_true(ble_airpods_parse_manufacturer_data(
         data, sizeof(data), &advertisement));
     g_assert_true(advertisement.worn);

@@ -145,6 +145,82 @@ static void test_parse_sink_inputs(void)
     g_ptr_array_unref(ids);
 }
 
+static void test_parse_default_and_configured_sink(void)
+{
+    gchar *sink = audio_route_parse_default_sink(
+        "alsa_output.usb-Speakers.analog-stereo\n");
+    g_assert_cmpstr(sink, ==,
+                    "alsa_output.usb-Speakers.analog-stereo");
+    g_free(sink);
+
+    const gchar *metadata =
+        "Found \"default\" metadata 45\n"
+        "update: id:0 key:'default.configured.audio.sink' "
+        "value:'{ \"name\": \"bluez_output.AA_BB_CC_DD_EE_FF.1\" }' "
+        "type:'Spa:String:JSON'\n";
+    sink = audio_route_parse_configured_sink(metadata);
+    g_assert_cmpstr(sink, ==,
+                    "bluez_output.AA_BB_CC_DD_EE_FF.1");
+    g_free(sink);
+
+    g_assert_null(audio_route_parse_default_sink("bad sink name\n"));
+    g_assert_null(audio_route_parse_configured_sink(
+        "update: id:0 key:'default.audio.source' "
+        "value:'{\"name\":\"not-a-sink\"}'\n"));
+}
+
+static void test_restore_sink_prefers_saved_live_non_bluetooth(void)
+{
+    const gchar *sinks =
+        "63\talsa_output.pci-hdmi.stereo\tPipeWire\ts32le\n"
+        "68\talsa_output.usb-Pebble.analog-stereo\tPipeWire\ts32le\n"
+        "91\tbluez_output.AA_BB_CC_DD_EE_FF.1\tPipeWire\ts32le\n";
+    gchar *sink = audio_route_find_restore_sink(
+        sinks, "alsa_output.usb-Pebble.analog-stereo");
+    g_assert_cmpstr(sink, ==,
+                    "alsa_output.usb-Pebble.analog-stereo");
+    g_free(sink);
+
+    sink = audio_route_find_restore_sink(sinks, "alsa_output.missing");
+    g_assert_cmpstr(sink, ==, "alsa_output.pci-hdmi.stereo");
+    g_free(sink);
+
+    g_assert_null(audio_route_find_restore_sink(
+        "91\tbluez_output.AA_BB_CC_DD_EE_FF.1\tPipeWire\ts32le\n",
+        NULL));
+}
+
+static void test_restore_filters_managed_sink_inputs(void)
+{
+    const gchar *sinks =
+        "68\talsa_output.usb-Pebble.analog-stereo\tPipeWire\ts32le\n"
+        "91\tbluez_output.AA_BB_CC_DD_EE_FF.1\tPipeWire\ts32le\n";
+    gchar *index = audio_route_find_sink_index(
+        sinks, "bluez_output.AA_BB_CC_DD_EE_FF.1");
+    g_assert_cmpstr(index, ==, "91");
+
+    const gchar *inputs =
+        "81\t91\t80\tPipeWire\tfloat32le\n"
+        "82\t68\t81\tPipeWire\tfloat32le\n"
+        "103\t91\t102\tPipeWire\tfloat32le\n";
+    GPtrArray *ids = audio_route_parse_sink_input_ids_for_sink(inputs, index);
+    g_assert_cmpuint(ids->len, ==, 2);
+    g_assert_cmpstr(g_ptr_array_index(ids, 0), ==, "81");
+    g_assert_cmpstr(g_ptr_array_index(ids, 1), ==, "103");
+    g_ptr_array_unref(ids);
+    g_free(index);
+}
+
+static void test_restore_compare_and_set_guard(void)
+{
+    const gchar *managed = "bluez_output.AA_BB_CC_DD_EE_FF.1";
+    g_assert_true(audio_route_should_restore_configured(managed, managed));
+    g_assert_false(audio_route_should_restore_configured(
+        "alsa_output.usb-Pebble.analog-stereo", managed));
+    g_assert_false(audio_route_should_restore_configured(NULL, managed));
+    g_assert_false(audio_route_should_restore_configured(managed, NULL));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -167,5 +243,13 @@ int main(int argc, char **argv)
                     test_does_not_match_address_outside_sink_name);
     g_test_add_func("/audio-route/reject-invalid", test_rejects_other_device_and_bad_address);
     g_test_add_func("/audio-route/parse-sink-inputs", test_parse_sink_inputs);
+    g_test_add_func("/audio-route/parse-defaults",
+                    test_parse_default_and_configured_sink);
+    g_test_add_func("/audio-route/restore-prefers-live-saved-sink",
+                    test_restore_sink_prefers_saved_live_non_bluetooth);
+    g_test_add_func("/audio-route/restore-filters-managed-inputs",
+                    test_restore_filters_managed_sink_inputs);
+    g_test_add_func("/audio-route/restore-compare-and-set",
+                    test_restore_compare_and_set_guard);
     return g_test_run();
 }

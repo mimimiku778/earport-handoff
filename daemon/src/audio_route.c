@@ -15,10 +15,24 @@
 
 typedef enum {
     ROUTE_OPERATION_FIND_SINK,
+    ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT,
+    ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT,
     ROUTE_OPERATION_SET_DEFAULT,
     ROUTE_OPERATION_LIST_INPUTS,
     ROUTE_OPERATION_MOVE_INPUT,
+    ROUTE_OPERATION_RESTORE_CHECK_CONFIGURED,
+    ROUTE_OPERATION_RESTORE_LIST_SINKS,
+    ROUTE_OPERATION_RESTORE_RECHECK_CONFIGURED,
+    ROUTE_OPERATION_RESTORE_SET_DEFAULT,
+    ROUTE_OPERATION_RESTORE_LIST_INPUTS,
+    ROUTE_OPERATION_RESTORE_MOVE_INPUT,
 } RouteOperationType;
+
+typedef enum {
+    ROUTE_MODE_IDLE,
+    ROUTE_MODE_SELECTING,
+    ROUTE_MODE_RESTORING,
+} RouteMode;
 
 typedef struct {
     AudioRoute *route;
@@ -28,6 +42,7 @@ typedef struct {
     GCancellable *cancellable;
     guint timeout_id;
     gchar *sink_name;
+    gchar *source_sink_index;
 } RouteOperation;
 
 struct AudioRoute {
@@ -39,6 +54,16 @@ struct AudioRoute {
     gchar *device_address;
     gchar *second_input_pass_sink;
     GCancellable *cancellable;
+    RouteMode mode;
+
+    /* Persist across cancellation so a later disconnect can undo only the
+     * default which this instance selected. */
+    gchar *previous_default_sink;
+    gchar *managed_sink;
+
+    /* Scratch state for one bounded restore attempt. */
+    gchar *restore_sink;
+    gchar *restore_managed_index;
 
     /* Non-owning keys. Each RouteOperation owns its process until its async
      * completion callback. This table lets cancellation terminate stale pactl
@@ -60,6 +85,10 @@ static void audio_route_unref(AudioRoute *route)
     g_clear_object(&route->cancellable);
     g_clear_pointer(&route->device_address, g_free);
     g_clear_pointer(&route->second_input_pass_sink, g_free);
+    g_clear_pointer(&route->previous_default_sink, g_free);
+    g_clear_pointer(&route->managed_sink, g_free);
+    g_clear_pointer(&route->restore_sink, g_free);
+    g_clear_pointer(&route->restore_managed_index, g_free);
     g_clear_pointer(&route->active_processes, g_hash_table_unref);
     g_free(route);
 }
@@ -302,6 +331,204 @@ GPtrArray *audio_route_parse_sink_input_ids(const char *pactl_output)
     return ids;
 }
 
+static gboolean sink_name_is_bluetooth(const char *sink_name)
+{
+    if (sink_name == NULL)
+        return FALSE;
+
+    gchar *lower = g_ascii_strdown(sink_name, -1);
+    gboolean bluetooth = g_strstr_len(lower, -1, "bluez") != NULL;
+    g_free(lower);
+    return bluetooth;
+}
+
+static gchar *parse_single_sink_name(const char *text)
+{
+    if (text == NULL)
+        return NULL;
+
+    gchar *line = g_strdup(text);
+    gchar *newline = strpbrk(line, "\r\n");
+    if (newline != NULL)
+        *newline = '\0';
+    g_strstrip(line);
+
+    if (*line == '\0' || strpbrk(line, " \t\r\n") != NULL) {
+        g_free(line);
+        return NULL;
+    }
+    return line;
+}
+
+gchar *audio_route_parse_default_sink(const char *pactl_output)
+{
+    return parse_single_sink_name(pactl_output);
+}
+
+gchar *audio_route_parse_configured_sink(const char *metadata_output)
+{
+    if (metadata_output == NULL)
+        return NULL;
+
+    gchar **lines = g_strsplit(metadata_output, "\n", -1);
+    gchar *result = NULL;
+    for (gchar **line = lines; *line != NULL && result == NULL; line++) {
+        if (g_strstr_len(*line, -1,
+                         "key:'default.configured.audio.sink'") == NULL) {
+            continue;
+        }
+
+        const gchar *name = g_strstr_len(*line, -1, "\"name\"");
+        if (name == NULL)
+            continue;
+        name = strchr(name + strlen("\"name\""), ':');
+        if (name == NULL)
+            continue;
+        name++;
+        while (g_ascii_isspace(*name))
+            name++;
+        if (*name != '"')
+            continue;
+        name++;
+
+        const gchar *end = name;
+        while (*end != '\0' && *end != '"' &&
+               !g_ascii_iscntrl(*end) && !g_ascii_isspace(*end)) {
+            end++;
+        }
+        if (*end == '"' && end > name)
+            result = g_strndup(name, (gsize)(end - name));
+    }
+
+    g_strfreev(lines);
+    return result;
+}
+
+static gboolean parse_short_sink_line(const char *line,
+                                      gchar **index_out,
+                                      gchar **name_out)
+{
+    gchar **fields = g_strsplit(line, "\t", 3);
+    if (fields[0] == NULL || fields[1] == NULL) {
+        g_strfreev(fields);
+        return FALSE;
+    }
+
+    g_strstrip(fields[0]);
+    g_strstrip(fields[1]);
+    const gchar *digit = fields[0];
+    while (g_ascii_isdigit(*digit))
+        digit++;
+    gboolean valid = fields[0][0] != '\0' && *digit == '\0' &&
+                     fields[1][0] != '\0';
+    if (valid) {
+        if (index_out != NULL)
+            *index_out = g_strdup(fields[0]);
+        if (name_out != NULL)
+            *name_out = g_strdup(fields[1]);
+    }
+    g_strfreev(fields);
+    return valid;
+}
+
+gchar *audio_route_find_restore_sink(const char *pactl_output,
+                                     const char *preferred_sink)
+{
+    if (pactl_output == NULL)
+        return NULL;
+
+    gchar *first_alsa = NULL;
+    gchar *first_other = NULL;
+    gchar **lines = g_strsplit(pactl_output, "\n", -1);
+    for (gchar **line = lines; *line != NULL; line++) {
+        gchar *name = NULL;
+        if (!parse_short_sink_line(*line, NULL, &name))
+            continue;
+        if (sink_name_is_bluetooth(name)) {
+            g_free(name);
+            continue;
+        }
+
+        if (preferred_sink != NULL &&
+            g_strcmp0(name, preferred_sink) == 0) {
+            g_clear_pointer(&first_alsa, g_free);
+            g_clear_pointer(&first_other, g_free);
+            g_strfreev(lines);
+            return name;
+        }
+
+        if (g_str_has_prefix(name, "alsa_output.") && first_alsa == NULL)
+            first_alsa = g_strdup(name);
+        else if (first_other == NULL)
+            first_other = g_strdup(name);
+        g_free(name);
+    }
+
+    g_strfreev(lines);
+    if (first_alsa != NULL) {
+        g_free(first_other);
+        return first_alsa;
+    }
+    return first_other;
+}
+
+gchar *audio_route_find_sink_index(const char *pactl_output,
+                                   const char *sink_name)
+{
+    if (pactl_output == NULL || sink_name == NULL)
+        return NULL;
+
+    gchar **lines = g_strsplit(pactl_output, "\n", -1);
+    gchar *result = NULL;
+    for (gchar **line = lines; *line != NULL && result == NULL; line++) {
+        gchar *index = NULL;
+        gchar *name = NULL;
+        if (parse_short_sink_line(*line, &index, &name) &&
+            g_strcmp0(name, sink_name) == 0) {
+            result = g_steal_pointer(&index);
+        }
+        g_free(index);
+        g_free(name);
+    }
+    g_strfreev(lines);
+    return result;
+}
+
+GPtrArray *audio_route_parse_sink_input_ids_for_sink(
+    const char *pactl_output,
+    const char *sink_index)
+{
+    GPtrArray *ids = g_ptr_array_new_with_free_func(g_free);
+    if (pactl_output == NULL || sink_index == NULL)
+        return ids;
+
+    gchar **lines = g_strsplit(pactl_output, "\n", -1);
+    for (gchar **line = lines; *line != NULL; line++) {
+        gchar **fields = g_strsplit(*line, "\t", 3);
+        if (fields[0] != NULL && fields[1] != NULL) {
+            g_strstrip(fields[0]);
+            g_strstrip(fields[1]);
+            const gchar *digit = fields[0];
+            while (g_ascii_isdigit(*digit))
+                digit++;
+            if (fields[0][0] != '\0' && *digit == '\0' &&
+                g_strcmp0(fields[1], sink_index) == 0) {
+                g_ptr_array_add(ids, g_strdup(fields[0]));
+            }
+        }
+        g_strfreev(fields);
+    }
+    g_strfreev(lines);
+    return ids;
+}
+
+gboolean audio_route_should_restore_configured(const char *configured_sink,
+                                               const char *managed_sink)
+{
+    return configured_sink != NULL && managed_sink != NULL &&
+           g_strcmp0(configured_sink, managed_sink) == 0;
+}
+
 static gboolean route_is_current(RouteOperation *operation)
 {
     AudioRoute *route = operation->route;
@@ -313,6 +540,8 @@ static gboolean route_is_current(RouteOperation *operation)
 static void route_schedule_retry(AudioRoute *route);
 static void route_query_sink(AudioRoute *route);
 static void route_list_inputs(AudioRoute *route, const gchar *sink_name);
+static void restore_query_configured(AudioRoute *route,
+                                     RouteOperationType type);
 
 static void route_operation_free(RouteOperation *operation)
 {
@@ -324,6 +553,7 @@ static void route_operation_free(RouteOperation *operation)
     g_clear_object(&operation->process);
     g_clear_object(&operation->cancellable);
     g_clear_pointer(&operation->sink_name, g_free);
+    g_clear_pointer(&operation->source_sink_index, g_free);
     audio_route_unref(operation->route);
     g_free(operation);
 }
@@ -435,6 +665,9 @@ static void route_schedule_second_input_pass(AudioRoute *route,
 
 static void route_set_default(AudioRoute *route, const gchar *sink_name)
 {
+    g_free(route->managed_sink);
+    route->managed_sink = g_strdup(sink_name);
+
     const gchar *argv[] = {
         "pactl", "set-default-sink", sink_name, NULL
     };
@@ -448,6 +681,115 @@ static void route_list_inputs(AudioRoute *route, const gchar *sink_name)
         "pactl", "list", "sink-inputs", "short", NULL
     };
     route_spawn(route, ROUTE_OPERATION_LIST_INPUTS, argv, sink_name);
+}
+
+static void route_capture_configured_default(AudioRoute *route,
+                                             const gchar *sink_name)
+{
+    const gchar *argv[] = {"pw-metadata", "-n", "default", NULL};
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT,
+                     argv,
+                     sink_name)) {
+        if (route->previous_default_sink != NULL)
+            route_set_default(route, sink_name);
+        else
+            route_schedule_retry(route);
+    }
+}
+
+static void route_capture_current_default(AudioRoute *route,
+                                          const gchar *sink_name)
+{
+    const gchar *argv[] = {"pactl", "get-default-sink", NULL};
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT,
+                     argv,
+                     sink_name)) {
+        route_schedule_retry(route);
+    }
+}
+
+static void restore_finish(AudioRoute *route, gboolean relinquish_ownership)
+{
+    if (route->retry_timeout_id > 0) {
+        g_source_remove(route->retry_timeout_id);
+        route->retry_timeout_id = 0;
+    }
+    route->mode = ROUTE_MODE_IDLE;
+    route->deadline_usec = 0;
+    g_clear_pointer(&route->restore_sink, g_free);
+    g_clear_pointer(&route->restore_managed_index, g_free);
+    if (relinquish_ownership) {
+        g_clear_pointer(&route->managed_sink, g_free);
+        g_clear_pointer(&route->previous_default_sink, g_free);
+    }
+}
+
+static void restore_list_sinks(AudioRoute *route)
+{
+    const gchar *argv[] = {"pactl", "list", "sinks", "short", NULL};
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_RESTORE_LIST_SINKS,
+                     argv,
+                     NULL)) {
+        route_schedule_retry(route);
+    }
+}
+
+static void restore_query_configured(AudioRoute *route,
+                                     RouteOperationType type)
+{
+    const gchar *argv[] = {"pw-metadata", "-n", "default", NULL};
+    if (!route_spawn(route, type, argv, NULL))
+        route_schedule_retry(route);
+}
+
+static void restore_set_default(AudioRoute *route)
+{
+    const gchar *argv[] = {
+        "pactl", "set-default-sink", route->restore_sink, NULL
+    };
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_RESTORE_SET_DEFAULT,
+                     argv,
+                     route->restore_sink)) {
+        route_schedule_retry(route);
+    }
+}
+
+static void restore_list_inputs(AudioRoute *route)
+{
+    const gchar *argv[] = {
+        "pactl", "list", "sink-inputs", "short", NULL
+    };
+    if (!route_spawn(route,
+                     ROUTE_OPERATION_RESTORE_LIST_INPUTS,
+                     argv,
+                     route->restore_sink)) {
+        restore_finish(route, TRUE);
+    }
+}
+
+static void restore_move_inputs(AudioRoute *route,
+                                const gchar *destination_sink,
+                                const gchar *source_sink_index,
+                                const gchar *pactl_output)
+{
+    GPtrArray *ids = audio_route_parse_sink_input_ids_for_sink(
+        pactl_output, source_sink_index);
+    for (guint i = 0; i < ids->len; i++) {
+        const gchar *argv[] = {
+            "pactl", "move-sink-input", g_ptr_array_index(ids, i),
+            destination_sink, NULL
+        };
+        route_spawn(route, ROUTE_OPERATION_RESTORE_MOVE_INPUT, argv, NULL);
+    }
+    if (ids->len > 0) {
+        g_debug("Queued %u AirPods audio stream(s) for restored output",
+                ids->len);
+    }
+    g_ptr_array_unref(ids);
 }
 
 static void route_operation_finished(GObject *source_object,
@@ -470,15 +812,42 @@ static void route_operation_finished(GObject *source_object,
             gchar *sink_name = find_sink_for_address(standard_output,
                                                      route->device_address);
             if (sink_name != NULL) {
-                route_set_default(route, sink_name);
+                route_capture_current_default(route, sink_name);
                 g_free(sink_name);
             } else {
                 route_schedule_retry(route);
             }
             break;
         }
+        case ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT: {
+            gchar *current_default = audio_route_parse_default_sink(
+                standard_output);
+            if (current_default != NULL &&
+                !sink_name_is_bluetooth(current_default)) {
+                g_free(route->previous_default_sink);
+                route->previous_default_sink = g_steal_pointer(
+                    &current_default);
+            }
+            g_free(current_default);
+            route_capture_configured_default(route,
+                                             operation->sink_name);
+            break;
+        }
+        case ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT: {
+            gchar *configured = audio_route_parse_configured_sink(
+                standard_output);
+            if (configured != NULL &&
+                !sink_name_is_bluetooth(configured)) {
+                g_free(route->previous_default_sink);
+                route->previous_default_sink = g_steal_pointer(&configured);
+            }
+            g_free(configured);
+            route_set_default(route, operation->sink_name);
+            break;
+        }
         case ROUTE_OPERATION_SET_DEFAULT:
             g_message("Selected AirPods as the default audio output");
+            route->mode = ROUTE_MODE_IDLE;
             route_list_inputs(route, operation->sink_name);
             route_schedule_second_input_pass(route, operation->sink_name);
             break;
@@ -487,11 +856,88 @@ static void route_operation_finished(GObject *source_object,
             break;
         case ROUTE_OPERATION_MOVE_INPUT:
             break;
+        case ROUTE_OPERATION_RESTORE_CHECK_CONFIGURED: {
+            gchar *configured = audio_route_parse_configured_sink(
+                standard_output);
+            if (audio_route_should_restore_configured(
+                    configured, route->managed_sink)) {
+                restore_list_sinks(route);
+            } else {
+                g_debug("Audio default changed outside EarPort; not restoring it");
+                restore_finish(route, TRUE);
+            }
+            g_free(configured);
+            break;
         }
-    } else if (current &&
-               (operation->type == ROUTE_OPERATION_FIND_SINK ||
-                operation->type == ROUTE_OPERATION_SET_DEFAULT)) {
-        route_schedule_retry(route);
+        case ROUTE_OPERATION_RESTORE_LIST_SINKS:
+            g_free(route->restore_sink);
+            route->restore_sink = audio_route_find_restore_sink(
+                standard_output, route->previous_default_sink);
+            g_free(route->restore_managed_index);
+            route->restore_managed_index = audio_route_find_sink_index(
+                standard_output, route->managed_sink);
+            if (route->restore_sink != NULL) {
+                restore_query_configured(
+                    route, ROUTE_OPERATION_RESTORE_RECHECK_CONFIGURED);
+            } else {
+                route_schedule_retry(route);
+            }
+            break;
+        case ROUTE_OPERATION_RESTORE_RECHECK_CONFIGURED: {
+            gchar *configured = audio_route_parse_configured_sink(
+                standard_output);
+            if (audio_route_should_restore_configured(
+                    configured, route->managed_sink)) {
+                restore_set_default(route);
+            } else {
+                g_debug("Audio default changed during restore; leaving it untouched");
+                restore_finish(route, TRUE);
+            }
+            g_free(configured);
+            break;
+        }
+        case ROUTE_OPERATION_RESTORE_SET_DEFAULT:
+            g_message("Restored the previous non-Bluetooth audio output");
+            if (route->restore_managed_index != NULL)
+                restore_list_inputs(route);
+            else
+                restore_finish(route, TRUE);
+            break;
+        case ROUTE_OPERATION_RESTORE_LIST_INPUTS:
+            restore_move_inputs(route,
+                                operation->sink_name,
+                                route->restore_managed_index,
+                                standard_output);
+            restore_finish(route, TRUE);
+            break;
+        case ROUTE_OPERATION_RESTORE_MOVE_INPUT:
+            break;
+        }
+    } else if (current) {
+        switch (operation->type) {
+        case ROUTE_OPERATION_CAPTURE_CONFIGURED_DEFAULT:
+            if (route->previous_default_sink != NULL)
+                route_set_default(route, operation->sink_name);
+            else
+                route_schedule_retry(route);
+            break;
+        case ROUTE_OPERATION_FIND_SINK:
+        case ROUTE_OPERATION_CAPTURE_CURRENT_DEFAULT:
+        case ROUTE_OPERATION_SET_DEFAULT:
+        case ROUTE_OPERATION_RESTORE_CHECK_CONFIGURED:
+        case ROUTE_OPERATION_RESTORE_LIST_SINKS:
+        case ROUTE_OPERATION_RESTORE_RECHECK_CONFIGURED:
+        case ROUTE_OPERATION_RESTORE_SET_DEFAULT:
+            route_schedule_retry(route);
+            break;
+        case ROUTE_OPERATION_RESTORE_LIST_INPUTS:
+            restore_finish(route, TRUE);
+            break;
+        case ROUTE_OPERATION_LIST_INPUTS:
+        case ROUTE_OPERATION_MOVE_INPUT:
+        case ROUTE_OPERATION_RESTORE_MOVE_INPUT:
+            break;
+        }
     }
 
     if (!communicated && error != NULL &&
@@ -508,7 +954,12 @@ static gboolean route_retry_timeout_cb(gpointer user_data)
 {
     AudioRoute *route = user_data;
     route->retry_timeout_id = 0;
-    route_query_sink(route);
+    if (route->mode == ROUTE_MODE_SELECTING) {
+        route_query_sink(route);
+    } else if (route->mode == ROUTE_MODE_RESTORING) {
+        restore_query_configured(
+            route, ROUTE_OPERATION_RESTORE_CHECK_CONFIGURED);
+    }
     return G_SOURCE_REMOVE;
 }
 
@@ -520,7 +971,14 @@ static void route_schedule_retry(AudioRoute *route)
     }
 
     if (g_get_monotonic_time() >= route->deadline_usec) {
-        g_debug("AirPods audio sink did not become ready within the route window");
+        if (route->mode == ROUTE_MODE_RESTORING) {
+            g_warning("Previous audio output could not be restored within the route window");
+            /* Retain ownership metadata so a later release trigger can retry. */
+            restore_finish(route, FALSE);
+        } else {
+            g_debug("AirPods audio sink did not become ready within the route window");
+            route->mode = ROUTE_MODE_IDLE;
+        }
         return;
     }
 
@@ -534,7 +992,8 @@ static void route_schedule_retry(AudioRoute *route)
 
 static void route_query_sink(AudioRoute *route)
 {
-    if (route->cancellable == NULL ||
+    if (route->mode != ROUTE_MODE_SELECTING ||
+        route->cancellable == NULL ||
         g_cancellable_is_cancelled(route->cancellable) ||
         g_get_monotonic_time() >= route->deadline_usec) {
         return;
@@ -580,7 +1039,10 @@ void audio_route_cancel(AudioRoute *route)
     g_clear_object(&route->cancellable);
     g_clear_pointer(&route->device_address, g_free);
     g_clear_pointer(&route->second_input_pass_sink, g_free);
+    g_clear_pointer(&route->restore_sink, g_free);
+    g_clear_pointer(&route->restore_managed_index, g_free);
     route->deadline_usec = 0;
+    route->mode = ROUTE_MODE_IDLE;
 }
 
 gboolean audio_route_start(AudioRoute *route, const char *device_address)
@@ -591,9 +1053,30 @@ gboolean audio_route_start(AudioRoute *route, const char *device_address)
     audio_route_cancel(route);
     route->device_address = g_strdup(device_address);
     route->cancellable = g_cancellable_new();
+    route->mode = ROUTE_MODE_SELECTING;
     route->deadline_usec = g_get_monotonic_time() +
                            ROUTE_DEADLINE_MSEC * G_TIME_SPAN_MILLISECOND;
     route_query_sink(route);
+    return TRUE;
+}
+
+gboolean audio_route_restore_previous(AudioRoute *route)
+{
+    if (route == NULL)
+        return FALSE;
+    if (route->mode == ROUTE_MODE_RESTORING)
+        return TRUE;
+
+    audio_route_cancel(route);
+    if (route->managed_sink == NULL)
+        return FALSE;
+
+    route->cancellable = g_cancellable_new();
+    route->mode = ROUTE_MODE_RESTORING;
+    route->deadline_usec = g_get_monotonic_time() +
+                           ROUTE_DEADLINE_MSEC * G_TIME_SPAN_MILLISECOND;
+    restore_query_configured(route,
+                             ROUTE_OPERATION_RESTORE_CHECK_CONFIGURED);
     return TRUE;
 }
 
@@ -603,5 +1086,7 @@ void audio_route_free(AudioRoute *route)
         return;
 
     audio_route_cancel(route);
+    g_clear_pointer(&route->managed_sink, g_free);
+    g_clear_pointer(&route->previous_default_sink, g_free);
     audio_route_unref(route);
 }

@@ -12,7 +12,7 @@
       <description>Show notification when battery is low</description>
     </key>
     <key name="enable-connection-notifications" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Enable connection notifications</summary>
       <description>Show notification when AirPods connect or disconnect</description>
     </key>

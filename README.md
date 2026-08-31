@@ -27,7 +27,7 @@ Requirements: **Ubuntu 26.04 or newer** with GNOME, BlueZ, and PipeWire.
 ```bash
 sudo apt update
 sudo apt install -y \
-  git meson ninja-build pkg-config \
+  git build-essential meson ninja-build pkg-config \
   libglib2.0-dev libbluetooth-dev \
   pulseaudio-utils
 ```
@@ -74,6 +74,17 @@ This removes the daemon, service, GNOME extension, and all EarPort user settings
 ```bash
 sudo systemctl restart bluetooth
 ```
+
+Alternatively, restore the backup created above if it is still the BlueZ configuration you want to keep:
+
+```bash
+sudo cp -- \
+  /etc/bluetooth/main.conf.pre-earport \
+  /etc/bluetooth/main.conf
+sudo systemctl restart bluetooth
+```
+
+After confirming Bluetooth works, the backup is no longer needed and may be removed with `sudo rm -- /etc/bluetooth/main.conf.pre-earport`. The installer never deletes this system backup automatically.
 
 Bluetooth pairings are intentionally left intact.
 AirPods cache host identity, so re-pair them if you remove or restore the `DeviceID` override.
