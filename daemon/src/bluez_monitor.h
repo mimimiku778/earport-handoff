@@ -34,6 +34,16 @@ typedef struct {
 /* Callback types */
 typedef void (*BluezDeviceCallback)(const BluezDeviceInfo *device, void *user_data);
 
+/* Disconnect calls are not cancellable once BlueZ accepts them. The retry
+ * predicate is consulted only after an error and again immediately before a
+ * retry, so rewear can stop future attempts without disturbing an accepted
+ * request. The finished callback reports the final outcome. */
+typedef bool (*BluezDisconnectRetryCheck)(const char *device_address,
+                                          void *user_data);
+typedef void (*BluezDisconnectFinishedCallback)(const char *device_address,
+                                                 bool completed,
+                                                 void *user_data);
+
 /* BlueZ monitor context */
 typedef struct BluezMonitor BluezMonitor;
 
@@ -78,6 +88,36 @@ void bluez_monitor_set_disconnected_callback(BluezMonitor *monitor,
 
 /** Enable continuous LE discovery and connect-on-confirmed-wear handling. */
 void bluez_monitor_set_auto_connect_on_wear(BluezMonitor *monitor, bool enabled);
+
+/* Suppress wear auto-connect for the selected paired AirPods after Linux has
+ * yielded to another Apple host. A stable BLE unworn observation rearms it. */
+bool bluez_monitor_suppress_auto_connect_until_unworn(
+    BluezMonitor *monitor,
+    const char *selector);
+
+/* Clear the retry cooldown and remembered BLE edge for a removed AirPods
+ * device. The next connection still requires a fresh unworn -> worn edge. */
+bool bluez_monitor_rearm_auto_connect_after_removal(
+    BluezMonitor *monitor,
+    const char *selector);
+
+/**
+ * Asynchronously disconnect a currently connected, cached AirPods device.
+ * selector may be either its Bluetooth address or its BlueZ object path; an
+ * arbitrary path is never called unless it matches a paired/known AirPods.
+ * Returns true when a request was queued or is already in flight.
+ */
+bool bluez_monitor_disconnect_device(BluezMonitor *monitor,
+                                     const char *selector,
+                                     BluezDisconnectRetryCheck retry_check,
+                                     BluezDisconnectFinishedCallback callback,
+                                     void *user_data);
+
+/* Asynchronously connect an exact paired, currently disconnected AirPods.
+ * Used when a device is reworn while an uncancellable removal Disconnect call
+ * is still completing. */
+bool bluez_monitor_connect_device(BluezMonitor *monitor,
+                                  const char *selector);
 
 /**
  * Check for already connected AirPods devices

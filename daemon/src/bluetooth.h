@@ -78,7 +78,10 @@ void bt_connection_set_state_callback(BluetoothConnection *conn,
  *
  * @param conn Connection context
  * @param address Bluetooth MAC address (XX:XX:XX:XX:XX:XX)
- * @return true if connection initiated, false on error
+ * The socket connection is non-blocking; completion is reported through the
+ * state callback.
+ *
+ * @return true if connection initiated, false on immediate error
  */
 bool bt_connection_connect(BluetoothConnection *conn, const char *address);
 
@@ -123,20 +126,9 @@ bool bt_connection_send_request_notifications(BluetoothConnection *conn);
 bool bt_connection_send_set_features(BluetoothConnection *conn);
 
 /**
- * Get file descriptor for event loop integration
- * Returns -1 if not connected
- */
-int bt_connection_get_fd(BluetoothConnection *conn);
-
-/**
  * Attach connection to GLib main loop
  * This sets up a GSource to monitor the socket
  */
 bool bt_connection_attach_to_mainloop(BluetoothConnection *conn, GMainContext *context);
-
-/**
- * Detach from main loop
- */
-void bt_connection_detach_from_mainloop(BluetoothConnection *conn);
 
 #endif /* BLUETOOTH_H */

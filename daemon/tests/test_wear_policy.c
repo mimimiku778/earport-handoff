@@ -109,6 +109,14 @@ static void test_mode_changes(void)
                     ==, WEAR_POLICY_ACTION_NONE);
 }
 
+static void test_fully_removed(void)
+{
+    g_assert_true(wear_policy_fully_removed(false, false));
+    g_assert_false(wear_policy_fully_removed(true, false));
+    g_assert_false(wear_policy_fully_removed(false, true));
+    g_assert_false(wear_policy_fully_removed(true, true));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -116,5 +124,6 @@ int main(int argc, char **argv)
     g_test_add_func("/wear-policy/initial-state", test_initial_state);
     g_test_add_func("/wear-policy/transitions", test_transitions);
     g_test_add_func("/wear-policy/mode-changes", test_mode_changes);
+    g_test_add_func("/wear-policy/fully-removed", test_fully_removed);
     return g_test_run();
 }

@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glib-unix.h>
 
 #include <sys/socket.h>
 #include <bluetooth/bluetooth.h>
@@ -29,8 +30,12 @@ struct BluetoothConnection {
     void *state_user_data;
 
     GSource *source;
+    guint connect_watch_id;
+    guint connect_timeout_id;
     uint8_t recv_buffer[BT_MAX_PACKET_SIZE];
 };
+
+#define BT_CONNECT_TIMEOUT_MSEC 5000
 
 bool bt_connection_get_local_audio_source_address(BluetoothConnection *conn,
                                                   uint8_t address[6])
@@ -70,6 +75,12 @@ void bt_connection_free(BluetoothConnection *conn)
     if (conn == NULL)
         return;
 
+    /* Freeing is terminal.  Do not let the disconnect notification re-enter
+     * user code with an object that is about to be released. */
+    conn->data_callback = NULL;
+    conn->data_user_data = NULL;
+    conn->state_callback = NULL;
+    conn->state_user_data = NULL;
     bt_connection_disconnect(conn);
     g_free(conn->address);
     g_free(conn);
@@ -99,6 +110,86 @@ static void set_state(BluetoothConnection *conn, BluetoothState state, const cha
     }
 }
 
+static void report_connect_error(BluetoothConnection *conn, const char *error)
+{
+    BtStateCallback callback = conn->state_callback;
+    void *user_data = conn->state_user_data;
+
+    /* A failed attempt is immediately retryable.  Complete every write to
+     * conn before invoking user code: the callback is allowed to free it. */
+    conn->state = BT_STATE_DISCONNECTED;
+    if (callback) {
+        callback(BT_STATE_ERROR, error, user_data);
+    }
+}
+
+static void cancel_pending_connect(BluetoothConnection *conn)
+{
+    if (conn->connect_watch_id > 0) {
+        g_source_remove(conn->connect_watch_id);
+        conn->connect_watch_id = 0;
+    }
+    if (conn->connect_timeout_id > 0) {
+        g_source_remove(conn->connect_timeout_id);
+        conn->connect_timeout_id = 0;
+    }
+}
+
+static void fail_pending_connect(BluetoothConnection *conn, int error_number)
+{
+    if (conn->socket_fd >= 0) {
+        close(conn->socket_fd);
+        conn->socket_fd = -1;
+    }
+
+    const char *message = strerror(error_number);
+    g_warning("Failed to establish the AirPods L2CAP channel: %s", message);
+    report_connect_error(conn, message);
+}
+
+static gboolean connect_ready_cb(gint fd,
+                                 GIOCondition condition,
+                                 gpointer user_data)
+{
+    BluetoothConnection *conn = user_data;
+    conn->connect_watch_id = 0;
+    if (conn->connect_timeout_id > 0) {
+        g_source_remove(conn->connect_timeout_id);
+        conn->connect_timeout_id = 0;
+    }
+
+    int socket_error = 0;
+    socklen_t error_length = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   &socket_error, &error_length) < 0) {
+        socket_error = errno;
+    } else if (socket_error == 0 &&
+               (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) != 0) {
+        socket_error = ECONNABORTED;
+    }
+
+    if (socket_error != 0) {
+        fail_pending_connect(conn, socket_error);
+        return G_SOURCE_REMOVE;
+    }
+
+    g_message("AirPods L2CAP channel connected");
+    set_state(conn, BT_STATE_CONNECTED, NULL);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean connect_timeout_cb(gpointer user_data)
+{
+    BluetoothConnection *conn = user_data;
+    conn->connect_timeout_id = 0;
+    if (conn->connect_watch_id > 0) {
+        g_source_remove(conn->connect_watch_id);
+        conn->connect_watch_id = 0;
+    }
+    fail_pending_connect(conn, ETIMEDOUT);
+    return G_SOURCE_REMOVE;
+}
+
 bool bt_connection_connect(BluetoothConnection *conn, const char *address)
 {
     if (conn->state != BT_STATE_DISCONNECTED) {
@@ -111,9 +202,7 @@ bool bt_connection_connect(BluetoothConnection *conn, const char *address)
     if (conn->socket_fd < 0) {
         int err = errno;
         g_warning("Failed to create L2CAP socket: %s", strerror(err));
-        set_state(conn, BT_STATE_ERROR, strerror(err));
-        /* Leave the state machine ready for another attempt */
-        conn->state = BT_STATE_DISCONNECTED;
+        report_connect_error(conn, strerror(err));
         return false;
     }
 
@@ -126,46 +215,75 @@ bool bt_connection_connect(BluetoothConnection *conn, const char *address)
         setsockopt(conn->socket_fd, SOL_L2CAP, L2CAP_OPTIONS, &opts, sizeof(opts));
     }
 
+    /* Make connect(2) non-blocking. BlueZ can take many seconds to reject an
+     * unavailable AAP PSM; blocking here used to freeze the GLib main loop,
+     * delaying PipeWire routing and every D-Bus callback with it. */
+    int flags = fcntl(conn->socket_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(conn->socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        int err = errno;
+        close(conn->socket_fd);
+        conn->socket_fd = -1;
+        report_connect_error(conn, strerror(err));
+        return false;
+    }
+
     /* Prepare destination address */
     struct sockaddr_l2 addr;
     memset(&addr, 0, sizeof(addr));
     addr.l2_family = AF_BLUETOOTH;
     addr.l2_psm = htobs(AIRPODS_L2CAP_PSM);
-    str2ba(address, &addr.l2_bdaddr);
-
-    g_free(conn->address);
-    conn->address = g_strdup(address);
-
-    set_state(conn, BT_STATE_CONNECTING, NULL);
-
-    g_message("Connecting to %s on PSM 0x%04X...", address, AIRPODS_L2CAP_PSM);
-
-    /* Connect (blocking for now, could be made async) */
-    if (connect(conn->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        int err = errno;
-        g_warning("Failed to connect to %s: %s", address, strerror(err));
+    if (str2ba(address, &addr.l2_bdaddr) < 0) {
         close(conn->socket_fd);
         conn->socket_fd = -1;
-        set_state(conn, BT_STATE_ERROR, strerror(err));
-        /* Leave the state machine ready for another attempt */
-        conn->state = BT_STATE_DISCONNECTED;
+        report_connect_error(conn, "Invalid Bluetooth address");
         return false;
     }
 
-    /* Set non-blocking after connect */
-    int flags = fcntl(conn->socket_fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(conn->socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        g_warning("Failed to set non-blocking mode: %s", strerror(errno));
+    g_free(conn->address);
+    conn->address = g_strdup(address);
+    /* Set the observable state before connect(2), but delay the callback until
+     * the entire asynchronous operation has been installed. State callbacks
+     * may legitimately free the connection, so no setup may follow one. */
+    conn->state = BT_STATE_CONNECTING;
+
+    g_message("Opening the AirPods control channel");
+
+    if (connect(conn->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        g_message("AirPods L2CAP channel connected");
+        set_state(conn, BT_STATE_CONNECTED, NULL);
+        return true;
     }
 
-    g_message("Connected to %s", address);
-    set_state(conn, BT_STATE_CONNECTED, NULL);
+    if (errno != EINPROGRESS && errno != EAGAIN && errno != EALREADY) {
+        int err = errno;
+        fail_pending_connect(conn, err);
+        return false;
+    }
 
+    conn->connect_watch_id = g_unix_fd_add_full(
+        G_PRIORITY_DEFAULT,
+        conn->socket_fd,
+        G_IO_OUT | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
+        connect_ready_cb,
+        conn,
+        NULL);
+    conn->connect_timeout_id = g_timeout_add(BT_CONNECT_TIMEOUT_MSEC,
+                                             connect_timeout_cb,
+                                             conn);
+
+    BtStateCallback callback = conn->state_callback;
+    void *user_data = conn->state_user_data;
+    if (callback)
+        callback(BT_STATE_CONNECTING, NULL, user_data);
+
+    /* Do not touch conn after the callback: it may have freed the object. */
     return true;
 }
 
 void bt_connection_disconnect(BluetoothConnection *conn)
 {
+    cancel_pending_connect(conn);
+
     if (conn->source) {
         g_source_destroy(conn->source);
         g_source_unref(conn->source);
@@ -230,11 +348,6 @@ bool bt_connection_send_set_features(BluetoothConnection *conn)
     return sent == AAP_SET_FEATURES_SIZE;
 }
 
-int bt_connection_get_fd(BluetoothConnection *conn)
-{
-    return conn->socket_fd;
-}
-
 /* GSource callbacks for main loop integration */
 typedef struct {
     GSource source;
@@ -251,7 +364,8 @@ static gboolean bt_source_prepare(GSource *source G_GNUC_UNUSED, gint *timeout)
 static gboolean bt_source_check(GSource *source)
 {
     BtSource *bt_source = (BtSource *)source;
-    return (bt_source->poll_fd.revents & G_IO_IN) != 0;
+    return (bt_source->poll_fd.revents &
+            (G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0;
 }
 
 static gboolean bt_source_dispatch(GSource *source,
@@ -319,7 +433,7 @@ bool bt_connection_attach_to_mainloop(BluetoothConnection *conn, GMainContext *c
     BtSource *bt_source = (BtSource *)g_source_new(&bt_source_funcs, sizeof(BtSource));
     bt_source->conn = conn;
     bt_source->poll_fd.fd = conn->socket_fd;
-    bt_source->poll_fd.events = G_IO_IN | G_IO_HUP | G_IO_ERR;
+    bt_source->poll_fd.events = G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL;
     bt_source->poll_fd.revents = 0;
 
     g_source_add_poll((GSource *)bt_source, &bt_source->poll_fd);
@@ -328,13 +442,4 @@ bool bt_connection_attach_to_mainloop(BluetoothConnection *conn, GMainContext *c
     conn->source = (GSource *)bt_source;
 
     return true;
-}
-
-void bt_connection_detach_from_mainloop(BluetoothConnection *conn)
-{
-    if (conn->source) {
-        g_source_destroy(conn->source);
-        g_source_unref(conn->source);
-        conn->source = NULL;
-    }
 }

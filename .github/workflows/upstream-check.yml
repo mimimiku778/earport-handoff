@@ -1,0 +1,73 @@
+name: Check upstream EarPort
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compare reviewed base with upstream
+        id: compare
+        run: |
+          ./scripts/check-upstream.sh | tee "$RUNNER_TEMP/upstream-report.md"
+          if grep -q '^Status: updates available$' "$RUNNER_TEMP/upstream-report.md"; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or refresh the upstream update issue
+        uses: actions/github-script@v8
+        env:
+          HAS_UPDATES: ${{ steps.compare.outputs.has_updates }}
+          REPORT_PATH: ${{ runner.temp }}/upstream-report.md
+        with:
+          script: |
+            const fs = require('fs');
+            const title = 'Upstream EarPort updates available';
+            const report = fs.readFileSync(process.env.REPORT_PATH, 'utf8');
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find(issue => !issue.pull_request && issue.title === title);
+
+            if (process.env.HAS_UPDATES === 'true') {
+              const body = [
+                'The scheduled upstream check found EarPort commits that have not been reviewed for this fork.',
+                '',
+                '```text',
+                report.trim(),
+                '```',
+                '',
+                'Merge them on a `sync-upstream` branch, run the full test suite, then update `UPSTREAM_BASE`.',
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+              } else {
+                await github.rest.issues.create({ owner, repo, title, body });
+              }
+            } else if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                state: 'closed',
+              });
+            }

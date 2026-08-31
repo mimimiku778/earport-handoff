@@ -1,5 +1,5 @@
 project('earport-daemon', 'c',
-    version: '0.3.0',
+    version: '0.4.0',
     license: 'GPL-3.0-or-later',
     default_options: [
         'c_std=c11',
@@ -35,9 +35,12 @@ sources = files(
     'src/config.c',
     'src/dbus_service.c',
     'src/media_control.c',
+    'src/media_playback_tracker.c',
+    'src/audio_route.c',
     'src/wear_policy.c',
     'src/connection_policy.c',
     'src/ble_autoconnect.c',
+    'src/handoff_policy.c',
 )
 
 # Build executable
@@ -52,9 +55,34 @@ test_models = executable(
     'test-models',
     files('tests/test_models.c', 'src/airpods_state.c', 'src/config.c'),
     include_directories: include_directories('src'),
-    dependencies: [glib_dep],
+    dependencies: [glib_dep, gio_dep],
 )
 test('models', test_models)
+
+test_config = executable(
+    'test-config',
+    files('tests/test_config.c', 'src/config.c', 'src/airpods_state.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep, gio_dep],
+)
+test('config', test_config)
+
+dbus_run_session = find_program('dbus-run-session', required: false)
+if dbus_run_session.found()
+    test_dbus_service = executable(
+        'test-dbus-service',
+        files('tests/test_dbus_service.c',
+              'src/dbus_service.c',
+              'src/airpods_state.c'),
+        include_directories: include_directories('src'),
+        dependencies: [glib_dep, gio_dep],
+    )
+    test(
+        'dbus-service',
+        dbus_run_session,
+        args: ['--', test_dbus_service],
+    )
+endif
 
 test_aap_protocol = executable(
     'test-aap-protocol',
@@ -87,6 +115,43 @@ test_ble_autoconnect = executable(
     dependencies: [glib_dep],
 )
 test('ble-autoconnect', test_ble_autoconnect)
+
+test_audio_route = executable(
+    'test-audio-route',
+    files('tests/test_audio_route.c', 'src/audio_route.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep, gio_dep],
+)
+test('audio-route', test_audio_route)
+
+test_media_playback_tracker = executable(
+    'test-media-playback-tracker',
+    files('tests/test_media_playback_tracker.c',
+          'src/media_playback_tracker.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('media-playback-tracker', test_media_playback_tracker)
+
+test_media_control_async = executable(
+    'test-media-control-async',
+    files('tests/test_media_control_async.c',
+          'src/media_control.c',
+          'src/media_playback_tracker.c',
+          'src/audio_route.c',
+          'src/wear_policy.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep, gio_dep],
+)
+test('media-control-async', test_media_control_async, timeout: 10)
+
+test_handoff_policy = executable(
+    'test-handoff-policy',
+    files('tests/test_handoff_policy.c', 'src/handoff_policy.c'),
+    include_directories: include_directories('src'),
+    dependencies: [glib_dep],
+)
+test('handoff-policy', test_handoff_policy)
 
 # Generate launcher files with the configured install prefix.  This keeps a
 # user-local install (the default used by install.sh) self-contained instead

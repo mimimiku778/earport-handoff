@@ -69,6 +69,7 @@ export default class EarPortPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         this._proxy = null;
         this._propertiesChangedId = 0;
+        this._proxyGeneration = (this._proxyGeneration ?? 0) + 1;
 
         /* Cleanup proxy when window is closed */
         window.connect('close-request', () => {
@@ -76,7 +77,7 @@ export default class EarPortPreferences extends ExtensionPreferences {
         });
 
         const page = new Adw.PreferencesPage({
-            title: 'EarPort',
+            title: this.metadata.name,
             icon_name: 'audio-headphones-symbolic',
         });
         window.add(page);
@@ -257,7 +258,7 @@ export default class EarPortPreferences extends ExtensionPreferences {
         page.add(aboutGroup);
 
         const aboutRow = new Adw.ActionRow({
-            title: 'EarPort',
+            title: this.metadata.name,
             subtitle: _('AirPods integration for GNOME'),
             icon_name: 'audio-headphones-symbolic',
         });
@@ -365,12 +366,17 @@ export default class EarPortPreferences extends ExtensionPreferences {
     }
 
     _connectProxy() {
+        const generation = this._proxyGeneration;
         try {
             this._proxy = new AirPodsProxy(
                 Gio.DBus.session,
                 BUS_NAME,
                 OBJECT_PATH,
                 (proxy, error) => {
+                    if (generation !== this._proxyGeneration ||
+                        proxy !== this._proxy)
+                        return;
+
                     if (error) {
                         this._statusRow.subtitle = _('Daemon not running');
                         this._setSensitive(false);
@@ -400,6 +406,7 @@ export default class EarPortPreferences extends ExtensionPreferences {
     }
 
     _disconnectProxy() {
+        this._proxyGeneration = (this._proxyGeneration ?? 0) + 1;
         if (this._proxy && this._propertiesChangedId) {
             this._proxy.disconnect(this._propertiesChangedId);
             this._propertiesChangedId = 0;

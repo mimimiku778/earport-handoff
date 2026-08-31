@@ -144,4 +144,17 @@ void dbus_service_emit_ear_detection_changed(DbusService *service,
 void dbus_service_emit_properties_changed(DbusService *service,
                                            const char *property_name);
 
+/** Emit one PropertiesChanged signal containing several related values. */
+void dbus_service_emit_properties_changed_many(
+    DbusService *service,
+    const char *const *property_names,
+    gsize property_count);
+
+/**
+ * Notify that every exported property has changed in one batched signal.
+ * Call this after resetting state so proxy caches cannot retain values from
+ * the previously connected device.
+ */
+void dbus_service_emit_all_properties_changed(DbusService *service);
+
 #endif /* DBUS_SERVICE_H */

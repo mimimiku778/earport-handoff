@@ -1,5 +1,5 @@
-EarPort Handoff — credits and acknowledgements
-================================================
+AirPods Seamless Switching for Ubuntu — credits and acknowledgements
+=====================================================================
 
 Upstream application
 --------------------
@@ -22,9 +22,29 @@ Apple Accessory Protocol parsing and the independently implemented handoff
 messages are informed by the GPL-licensed LibrePods code and documentation:
 https://github.com/librepods-org/librepods
 
-AirPods Max 2 model identifiers and capability behavior were cross-checked
-against the GPL-licensed CAPod project:
+The inherited EarPort protocol credits acknowledge LibrePods by Kavish Devar
+(@kavishdevar), the wider LibrePods contributor community, and these protocol
+and implementation contributors:
+
+- @tyalie — protocol documentation
+- @tim-gromeyer — Linux implementation work
+- @devnoname120 — root patch assistance
+- @rithvikvibhu — hearing-aid feature support
+
+AirPods Max 2 classification and capability behavior were also cross-checked
+against the MIT-licensed omarchy-pods project:
+https://github.com/thisisgm/omarchy-pods
+
+AirPods 4 and Max 2 BLE identifiers, public advertisement layout, and wear
+bits were cross-checked against the GPL-licensed CAPod project:
 https://github.com/d4rken-org/capod
+
+The public AAP packet examples in tyalie/AAP-Protocol-Defintion include the
+explicit current-wear-state request used by the polling fallback:
+https://github.com/tyalie/AAP-Protocol-Defintion
+
+That protocol-definition repository has no license file. Protocol bytes and
+facts were referenced; no source code was incorporated from it.
 
 The independent xatuke/handoff experiment helped demonstrate the intended
 Apple/Linux ownership behavior:

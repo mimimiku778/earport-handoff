@@ -9,7 +9,49 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build pkg-config \
+            gettext libglib2.0-dev libbluetooth-dev nodejs shellcheck
+      - name: Configure
+        run: meson setup daemon/build daemon --buildtype=debug -Dwerror=true -Dwarning_level=3
+      - name: Build
+        run: meson compile -C daemon/build
+      - name: Test
+        run: meson test -C daemon/build --print-errorlogs
+      - name: Check installer and extension
+        run: |
+          bash -n install.sh
+          shellcheck install.sh scripts/check-upstream.sh
+          node --check extension/extension.js
+          node --check extension/prefs.js
+          node --check extension/dbusInterface.js
+          python3 -m json.tool extension/metadata.json >/dev/null
+          glib-compile-schemas --strict --dry-run extension/schemas
+          git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+      - name: Check generated extension files
+        run: |
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$temp_dir"' EXIT
+          cp extension/schemas/*.xml "$temp_dir/"
+          glib-compile-schemas --strict "$temp_dir"
+          cmp "$temp_dir/gschemas.compiled" extension/schemas/gschemas.compiled
+          msgfmt --check -o "$temp_dir/fr.mo" po/fr.po
+          msgfmt --check -o "$temp_dir/uk.mo" po/uk.po
+          cmp "$temp_dir/fr.mo" extension/locale/fr/LC_MESSAGES/earport.mo
+          cmp "$temp_dir/uk.mo" extension/locale/uk/LC_MESSAGES/earport.mo
+      - name: Check staged installation
+        run: DESTDIR="$RUNNER_TEMP/stage" meson install -C daemon/build
+
+  sanitizers:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Install build dependencies
@@ -18,11 +60,17 @@ jobs:
           sudo apt-get install -y \
             meson ninja-build pkg-config \
             libglib2.0-dev libbluetooth-dev
-      - name: Configure
-        run: meson setup daemon/build daemon --buildtype=debug -Dwerror=true -Dwarning_level=3
-      - name: Build
-        run: meson compile -C daemon/build
-      - name: Test
-        run: meson test -C daemon/build --print-errorlogs
-      - name: Check installer syntax
-        run: bash -n install.sh
+      - name: Configure with ASan and UBSan
+        run: |
+          meson setup daemon/build-sanitize daemon \
+            --buildtype=debug \
+            -Dwerror=true \
+            -Dwarning_level=3 \
+            -Db_sanitize=address,undefined
+      - name: Build and test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          meson compile -C daemon/build-sanitize
+          meson test -C daemon/build-sanitize --print-errorlogs

@@ -8,7 +8,7 @@
 #define APPLE_PROXIMITY_LENGTH 25
 #define APPLE_PROXIMITY_PREFIX 0x01
 
-static bool model_is_supported(uint16_t model)
+bool ble_airpods_model_supports_wear_autoconnect(uint16_t model)
 {
     switch ((AirPodsModel)model) {
     case AIRPODS_MODEL_4:
@@ -23,15 +23,12 @@ static bool model_is_supported(uint16_t model)
 
 static bool model_status_is_worn(uint16_t model, uint8_t status)
 {
-    /* Max 2 may report only one cup bit on some hosts, so either bit is an
-     * aggregate worn signal. For AirPods 4, require both in-ear bits: this is
-     * deliberately conservative and avoids connecting from a stale one-bud
-     * or in-case advertisement. */
-    if (model == AIRPODS_MODEL_MAX_2)
-        return (status & ((1u << 1) | (1u << 3))) != 0;
-
-    return (status & ((1u << 1) | (1u << 3))) ==
-           ((1u << 1) | (1u << 3));
+    /* Bits 1 and 3 are the public per-side wear flags on the supported
+     * models. Either side is enough: AirPods 4 must support one-bud use, and
+     * Max 2 may report only one cup bit on some hosts. Case/status bits are
+     * intentionally ignored. */
+    (void)model;
+    return (status & ((1u << 1) | (1u << 3))) != 0;
 }
 
 bool ble_airpods_parse_manufacturer_data(const uint8_t *data,
@@ -57,7 +54,7 @@ bool ble_airpods_parse_manufacturer_data(const uint8_t *data,
                 return false;
 
             uint16_t model = ((uint16_t)payload[1] << 8) | payload[2];
-            if (!model_is_supported(model))
+            if (!ble_airpods_model_supports_wear_autoconnect(model))
                 return false;
 
             advertisement->model = model;
@@ -79,6 +76,7 @@ uint16_t ble_airpods_bluez_product_id(uint16_t ble_model)
 
 bool ble_autoconnect_observe(BleAutoConnectState *state,
                              bool worn,
+                             bool confirm_first_worn,
                              int64_t now_usec,
                              int64_t confirmation_window_usec,
                              int64_t cooldown_usec)
@@ -98,6 +96,14 @@ bool ble_autoconnect_observe(BleAutoConnectState *state,
     if (!state->has_observed_unworn)
         return false;
 
+    /* A successful attempt consumes the entire wear edge. Do not turn a
+     * continuously-worn advertisement into a new edge merely because the
+     * confirmation window elapsed; that can reconnect Linux after an iPhone
+     * handoff and steal AirPods 4 back. Only an explicit unworn observation
+     * above may re-arm the state machine. */
+    if (state->sequence_consumed)
+        return false;
+
     bool outside_window = state->worn_sequence_active &&
         (now_usec < state->first_worn_observation_usec ||
          now_usec - state->first_worn_observation_usec > confirmation_window_usec);
@@ -107,7 +113,8 @@ bool ble_autoconnect_observe(BleAutoConnectState *state,
         state->worn_observations = 1;
         state->first_worn_observation_usec = now_usec;
         state->sequence_consumed = false;
-        return false;
+        if (!confirm_first_worn)
+            return false;
     }
 
     if (state->worn_observations < 2)
@@ -127,4 +134,42 @@ bool ble_autoconnect_observe(BleAutoConnectState *state,
     state->has_attempted = true;
     state->last_attempt_usec = now_usec;
     return true;
+}
+
+void ble_handoff_suppression_activate(BleHandoffSuppressionState *state)
+{
+    if (state == NULL)
+        return;
+
+    state->active = true;
+    state->first_unworn_observation_usec = 0;
+}
+
+bool ble_handoff_suppression_observe(BleHandoffSuppressionState *state,
+                                     bool worn,
+                                     int64_t now_usec,
+                                     int64_t unworn_rearm_usec)
+{
+    if (state == NULL || !state->active || unworn_rearm_usec < 0)
+        return false;
+
+    if (worn) {
+        state->first_unworn_observation_usec = 0;
+        return true;
+    }
+
+    if (state->first_unworn_observation_usec == 0 ||
+        now_usec < state->first_unworn_observation_usec) {
+        state->first_unworn_observation_usec = now_usec;
+        return true;
+    }
+
+    if (now_usec - state->first_unworn_observation_usec <
+        unworn_rearm_usec) {
+        return true;
+    }
+
+    state->active = false;
+    state->first_unworn_observation_usec = 0;
+    return false;
 }

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <gio/gio.h>
 #include <glib/gstdio.h>
 
 #define CONFIG_DIR_NAME "earport"
@@ -41,10 +42,7 @@ static void migrate_legacy_config_dir(void)
     gchar *new_dir = get_config_dir();
     gchar *old_dir = g_build_filename(g_get_user_config_dir(),
                                       LEGACY_CONFIG_DIR_NAME, NULL);
-    gchar *new_conf = g_build_filename(new_dir, CONFIG_FILE_NAME, NULL);
-
-    if (g_file_test(old_dir, G_FILE_TEST_IS_DIR) &&
-        !g_file_test(new_conf, G_FILE_TEST_EXISTS)) {
+    if (g_file_test(old_dir, G_FILE_TEST_IS_DIR)) {
         if (!ensure_config_dir())
             goto out;
 
@@ -52,11 +50,27 @@ static void migrate_legacy_config_dir(void)
             gchar *src = g_build_filename(old_dir, config_files[i], NULL);
             gchar *dst = g_build_filename(new_dir, config_files[i], NULL);
             if (g_file_test(src, G_FILE_TEST_EXISTS)) {
-                if (g_rename(src, dst) == 0) {
+                GFile *source = g_file_new_for_path(src);
+                GFile *destination = g_file_new_for_path(dst);
+                GError *error = NULL;
+
+                /* G_FILE_COPY_NONE deliberately omits OVERWRITE: unlike a
+                 * check followed by rename(2), this remains no-clobber if a
+                 * destination appears concurrently. */
+                if (g_file_move(source, destination, G_FILE_COPY_NONE,
+                                NULL, NULL, NULL, &error)) {
                     g_message("Migrated %s to %s", src, dst);
+                } else if (!g_error_matches(error, G_IO_ERROR,
+                                            G_IO_ERROR_EXISTS)) {
+                    g_warning("Failed to migrate %s: %s", src,
+                              error ? error->message : "unknown error");
                 } else {
-                    g_warning("Failed to migrate %s: %s", src, g_strerror(errno));
+                    g_debug("Keeping existing config file %s", dst);
                 }
+
+                g_clear_error(&error);
+                g_object_unref(destination);
+                g_object_unref(source);
             }
             g_free(src);
             g_free(dst);
@@ -67,7 +81,6 @@ static void migrate_legacy_config_dir(void)
     }
 
 out:
-    g_free(new_conf);
     g_free(old_dir);
     g_free(new_dir);
 }
@@ -83,7 +96,7 @@ static gchar *get_config_path(void)
 static bool ensure_config_dir(void)
 {
     gchar *config_dir = get_config_dir();
-    int result = g_mkdir_with_parents(config_dir, 0755);
+    int result = g_mkdir_with_parents(config_dir, 0700);
     g_free(config_dir);
 
     if (result != 0 && errno != EEXIST) {
@@ -96,9 +109,10 @@ static bool ensure_config_dir(void)
 
 void config_get_defaults(EarPortConfig *config)
 {
-    config->ear_pause_mode = 1;  /* EAR_PAUSE_ONE_OUT */
+    config->ear_pause_mode = 2;  /* EAR_PAUSE_BOTH_OUT; supports one-bud use */
     config->handoff_enabled = true;
     config->auto_connect_on_wear = true;
+    config->disconnect_on_removal = true;
 }
 
 bool config_load(EarPortConfig *config)
@@ -113,18 +127,21 @@ bool config_load(EarPortConfig *config)
     GError *error = NULL;
 
     if (!g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, &error)) {
-        if (error != NULL) {
-            if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-                g_warning("Failed to load config file: %s", error->message);
-            }
-            g_error_free(error);
-        }
+        bool missing = error != NULL &&
+                       g_error_matches(error, G_FILE_ERROR,
+                                       G_FILE_ERROR_NOENT);
+        if (!missing)
+            g_warning("Failed to load config file: %s",
+                      error ? error->message : "unknown error");
+
+        g_clear_error(&error);
         g_key_file_free(keyfile);
         g_free(config_path);
 
-        /* Create default config file */
-        config_save(config);
-        return true;
+        /* A missing file is the only safe case in which to create defaults.
+         * A malformed or unreadable file may contain the user's only copy of
+         * their settings and must never be overwritten implicitly. */
+        return missing ? config_save(config) : false;
     }
 
     /* Read settings */
@@ -133,7 +150,7 @@ bool config_load(EarPortConfig *config)
 
         /* Validate range */
         if (config->ear_pause_mode < 0 || config->ear_pause_mode > 2) {
-            config->ear_pause_mode = 1;
+            config->ear_pause_mode = 2;
         }
     }
 
@@ -147,10 +164,16 @@ bool config_load(EarPortConfig *config)
             keyfile, CONFIG_GROUP, "auto_connect_on_wear", NULL);
     }
 
-    g_message("Config loaded: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s",
+    if (g_key_file_has_key(keyfile, CONFIG_GROUP, "disconnect_on_removal", NULL)) {
+        config->disconnect_on_removal = g_key_file_get_boolean(
+            keyfile, CONFIG_GROUP, "disconnect_on_removal", NULL);
+    }
+
+    g_message("Config loaded: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s, disconnect_on_removal=%s",
               config->ear_pause_mode,
               config->handoff_enabled ? "true" : "false",
-              config->auto_connect_on_wear ? "true" : "false");
+              config->auto_connect_on_wear ? "true" : "false",
+              config->disconnect_on_removal ? "true" : "false");
 
     g_key_file_free(keyfile);
     g_free(config_path);
@@ -170,13 +193,16 @@ bool config_save(const EarPortConfig *config)
     g_key_file_set_boolean(keyfile, CONFIG_GROUP, "handoff_enabled", config->handoff_enabled);
     g_key_file_set_boolean(keyfile, CONFIG_GROUP, "auto_connect_on_wear",
                            config->auto_connect_on_wear);
+    g_key_file_set_boolean(keyfile, CONFIG_GROUP, "disconnect_on_removal",
+                           config->disconnect_on_removal);
 
     /* Add comment */
     g_key_file_set_comment(keyfile, CONFIG_GROUP, NULL,
                            "EarPort daemon configuration\n"
                            "ear_pause_mode: 0=disabled, 1=pause when one removed, 2=pause when both removed\n"
                            "handoff_enabled: claim AirPods audio when Linux playback starts\n"
-                           "auto_connect_on_wear: scan BLE and connect a uniquely matched paired AirPods device when worn",
+                           "auto_connect_on_wear: scan BLE and connect a uniquely matched paired AirPods device when worn\n"
+                           "disconnect_on_removal: disconnect BlueZ after both AAP wear slots stay out for one second",
                            NULL);
 
     gchar *config_path = get_config_path();
@@ -190,19 +216,16 @@ bool config_save(const EarPortConfig *config)
         return false;
     }
 
-    g_message("Config saved: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s",
+    g_message("Config saved: ear_pause_mode=%d, handoff_enabled=%s, auto_connect_on_wear=%s, disconnect_on_removal=%s",
               config->ear_pause_mode,
               config->handoff_enabled ? "true" : "false",
-              config->auto_connect_on_wear ? "true" : "false");
+              config->auto_connect_on_wear ? "true" : "false",
+              config->disconnect_on_removal ? "true" : "false");
 
     g_key_file_free(keyfile);
     g_free(config_path);
     return true;
 }
-
-/* ============================================================================
- * Per-device listening modes configuration
- * ========================================================================== */
 
 #define DEVICES_FILE_NAME "devices.conf"
 
@@ -212,6 +235,27 @@ static gchar *get_devices_config_path(void)
     gchar *config_path = g_build_filename(config_dir, DEVICES_FILE_NAME, NULL);
     g_free(config_dir);
     return config_path;
+}
+
+static bool load_existing_key_file_for_update(GKeyFile *keyfile,
+                                              const char *config_path)
+{
+    GError *error = NULL;
+    if (g_key_file_load_from_file(keyfile, config_path,
+                                  G_KEY_FILE_KEEP_COMMENTS, &error)) {
+        return true;
+    }
+
+    if (error != NULL &&
+        g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        g_clear_error(&error);
+        return true;
+    }
+
+    g_warning("Refusing to overwrite devices config: %s",
+              error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return false;
 }
 
 /* Convert MAC address to group name (replace : with _) */
@@ -224,123 +268,35 @@ static gchar *address_to_group(const char *address)
     return group;
 }
 
-void config_get_default_listening_modes(ListeningModesConfig *modes)
-{
-    /* Default: ANC and Transparency enabled (like Apple defaults) */
-    modes->off_enabled = false;
-    modes->transparency_enabled = true;
-    modes->anc_enabled = true;
-    modes->adaptive_enabled = false;
-}
-
-bool config_load_device_listening_modes(const char *device_address, ListeningModesConfig *modes)
-{
-    /* Start with defaults */
-    config_get_default_listening_modes(modes);
-
-    if (device_address == NULL || device_address[0] == '\0') {
-        return false;
-    }
-
-    gchar *config_path = get_devices_config_path();
-    GKeyFile *keyfile = g_key_file_new();
-    GError *error = NULL;
-
-    if (!g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, &error)) {
-        if (error != NULL) {
-            if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-                g_warning("Failed to load devices config: %s", error->message);
-            }
-            g_error_free(error);
-        }
-        g_key_file_free(keyfile);
-        g_free(config_path);
-        return false;
-    }
-
-    gchar *group = address_to_group(device_address);
-
-    if (!g_key_file_has_group(keyfile, group)) {
-        g_key_file_free(keyfile);
-        g_free(config_path);
-        g_free(group);
-        return false;
-    }
-
-    /* Read listening modes */
-    if (g_key_file_has_key(keyfile, group, "listening_mode_off", NULL)) {
-        modes->off_enabled = g_key_file_get_boolean(keyfile, group, "listening_mode_off", NULL);
-    }
-    if (g_key_file_has_key(keyfile, group, "listening_mode_transparency", NULL)) {
-        modes->transparency_enabled = g_key_file_get_boolean(keyfile, group, "listening_mode_transparency", NULL);
-    }
-    if (g_key_file_has_key(keyfile, group, "listening_mode_anc", NULL)) {
-        modes->anc_enabled = g_key_file_get_boolean(keyfile, group, "listening_mode_anc", NULL);
-    }
-    if (g_key_file_has_key(keyfile, group, "listening_mode_adaptive", NULL)) {
-        modes->adaptive_enabled = g_key_file_get_boolean(keyfile, group, "listening_mode_adaptive", NULL);
-    }
-
-    g_message("Loaded listening modes for %s: off=%d, transparency=%d, anc=%d, adaptive=%d",
-              device_address,
-              modes->off_enabled, modes->transparency_enabled,
-              modes->anc_enabled, modes->adaptive_enabled);
-
-    g_key_file_free(keyfile);
-    g_free(config_path);
-    g_free(group);
-    return true;
-}
-
-bool config_save_device_listening_modes(const char *device_address, const ListeningModesConfig *modes)
-{
-    if (device_address == NULL || device_address[0] == '\0') {
-        g_warning("Cannot save listening modes: no device address");
-        return false;
-    }
-
-    if (!ensure_config_dir()) {
-        return false;
-    }
-
-    gchar *config_path = get_devices_config_path();
-    GKeyFile *keyfile = g_key_file_new();
-    GError *error = NULL;
-
-    /* Load existing file if present */
-    g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_KEEP_COMMENTS, NULL);
-
-    gchar *group = address_to_group(device_address);
-
-    /* Write listening modes */
-    g_key_file_set_boolean(keyfile, group, "listening_mode_off", modes->off_enabled);
-    g_key_file_set_boolean(keyfile, group, "listening_mode_transparency", modes->transparency_enabled);
-    g_key_file_set_boolean(keyfile, group, "listening_mode_anc", modes->anc_enabled);
-    g_key_file_set_boolean(keyfile, group, "listening_mode_adaptive", modes->adaptive_enabled);
-
-    if (!g_key_file_save_to_file(keyfile, config_path, &error)) {
-        g_warning("Failed to save devices config: %s", error->message);
-        g_error_free(error);
-        g_key_file_free(keyfile);
-        g_free(config_path);
-        g_free(group);
-        return false;
-    }
-
-    g_message("Saved listening modes for %s: off=%d, transparency=%d, anc=%d, adaptive=%d",
-              device_address,
-              modes->off_enabled, modes->transparency_enabled,
-              modes->anc_enabled, modes->adaptive_enabled);
-
-    g_key_file_free(keyfile);
-    g_free(config_path);
-    g_free(group);
-    return true;
-}
-
 /* ============================================================================
  * Complete device profile management
  * ========================================================================== */
+
+void config_copy_display_name(
+    char destination[DEVICE_PROFILE_DISPLAY_NAME_SIZE],
+    const char *source)
+{
+    g_return_if_fail(destination != NULL);
+
+    if (source == NULL || source[0] == '\0') {
+        destination[0] = '\0';
+        return;
+    }
+
+    gchar *valid = g_utf8_make_valid(source, -1);
+    gsize valid_len = strlen(valid);
+    gsize copy_len = MIN(valid_len,
+                         (gsize)DEVICE_PROFILE_DISPLAY_NAME_SIZE - 1);
+    if (copy_len < valid_len) {
+        const gchar *valid_end = NULL;
+        if (!g_utf8_validate(valid, (gssize)copy_len, &valid_end))
+            copy_len = (gsize)(valid_end - valid);
+    }
+
+    memcpy(destination, valid, copy_len);
+    destination[copy_len] = '\0';
+    g_free(valid);
+}
 
 void config_get_default_profile(DeviceProfile *profile)
 {
@@ -358,7 +314,6 @@ void config_get_default_profile(DeviceProfile *profile)
     /* Default feature settings */
     profile->conversational_awareness = false;
     profile->adaptive_noise_level = 50;
-    strncpy(profile->preferred_nc_mode, "anc", sizeof(profile->preferred_nc_mode) - 1);
 
     profile->has_saved_settings = false;
 }
@@ -401,8 +356,7 @@ bool config_load_device_profile(const char *device_address, DeviceProfile *profi
     if (g_key_file_has_key(keyfile, group, "display_name", NULL)) {
         gchar *name = g_key_file_get_string(keyfile, group, "display_name", NULL);
         if (name) {
-            strncpy(profile->display_name, name, sizeof(profile->display_name) - 1);
-            profile->display_name[sizeof(profile->display_name) - 1] = '\0';
+            config_copy_display_name(profile->display_name, name);
             g_free(name);
         }
     }
@@ -431,22 +385,13 @@ bool config_load_device_profile(const char *device_address, DeviceProfile *profi
         if (profile->adaptive_noise_level < 0) profile->adaptive_noise_level = 0;
         if (profile->adaptive_noise_level > 100) profile->adaptive_noise_level = 100;
     }
-    if (g_key_file_has_key(keyfile, group, "preferred_nc_mode", NULL)) {
-        gchar *mode = g_key_file_get_string(keyfile, group, "preferred_nc_mode", NULL);
-        if (mode) {
-            strncpy(profile->preferred_nc_mode, mode, sizeof(profile->preferred_nc_mode) - 1);
-            profile->preferred_nc_mode[sizeof(profile->preferred_nc_mode) - 1] = '\0';
-            g_free(mode);
-        }
-    }
-
     /* Check if this profile has been explicitly saved */
     if (g_key_file_has_key(keyfile, group, "has_saved_settings", NULL)) {
         profile->has_saved_settings = g_key_file_get_boolean(keyfile, group, "has_saved_settings", NULL);
     }
 
-    g_message("Loaded profile for %s: display_name='%s', nc_mode=%s, ca=%d, adaptive_level=%d",
-              device_address, profile->display_name, profile->preferred_nc_mode,
+    g_message("Loaded profile for %s: display_name='%s', ca=%d, adaptive_level=%d",
+              device_address, profile->display_name,
               profile->conversational_awareness, profile->adaptive_noise_level);
 
     g_key_file_free(keyfile);
@@ -469,13 +414,24 @@ bool config_save_device_profile(const char *device_address, const DeviceProfile 
     gchar *config_path = get_devices_config_path();
     GKeyFile *keyfile = g_key_file_new();
 
-    /* Load existing file if present */
-    g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_KEEP_COMMENTS, NULL);
+    /* Preserve other device profiles, and never replace a malformed or
+     * unreadable file with a partial one. */
+    if (!load_existing_key_file_for_update(keyfile, config_path)) {
+        g_key_file_free(keyfile);
+        g_free(config_path);
+        return false;
+    }
 
     gchar *group = address_to_group(device_address);
 
-    /* Write display name */
-    g_key_file_set_string(keyfile, group, "display_name", profile->display_name);
+    /* Write only valid, bounded UTF-8 even if a future caller constructs the
+     * fixed profile field without going through config_copy_display_name(). */
+    gchar *raw_display_name = g_strndup(
+        profile->display_name, DEVICE_PROFILE_DISPLAY_NAME_SIZE - 1);
+    char display_name[DEVICE_PROFILE_DISPLAY_NAME_SIZE];
+    config_copy_display_name(display_name, raw_display_name);
+    g_free(raw_display_name);
+    g_key_file_set_string(keyfile, group, "display_name", display_name);
 
     /* Write listening modes */
     g_key_file_set_boolean(keyfile, group, "listening_mode_off", profile->listening_modes.off_enabled);
@@ -485,8 +441,8 @@ bool config_save_device_profile(const char *device_address, const DeviceProfile 
 
     /* Write feature settings */
     g_key_file_set_boolean(keyfile, group, "conversational_awareness", profile->conversational_awareness);
-    g_key_file_set_integer(keyfile, group, "adaptive_noise_level", profile->adaptive_noise_level);
-    g_key_file_set_string(keyfile, group, "preferred_nc_mode", profile->preferred_nc_mode);
+    g_key_file_set_integer(keyfile, group, "adaptive_noise_level",
+                           CLAMP(profile->adaptive_noise_level, 0, 100));
     g_key_file_set_boolean(keyfile, group, "has_saved_settings", true);
 
     GError *error = NULL;
@@ -499,8 +455,8 @@ bool config_save_device_profile(const char *device_address, const DeviceProfile 
         return false;
     }
 
-    g_message("Saved profile for %s: display_name='%s', nc_mode=%s, ca=%d, adaptive_level=%d",
-              device_address, profile->display_name, profile->preferred_nc_mode,
+    g_message("Saved profile for %s: display_name='%s', ca=%d, adaptive_level=%d",
+              device_address, display_name,
               profile->conversational_awareness, profile->adaptive_noise_level);
 
     g_key_file_free(keyfile);

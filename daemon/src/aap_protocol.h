@@ -26,11 +26,13 @@
 #define AAP_HANDSHAKE_HEADER_BYTE1 0x00
 
 /* Opcodes */
-#define AAP_OPCODE_BATTERY       0x04
-#define AAP_OPCODE_EAR_DETECTION 0x06
+#define AAP_OPCODE_BATTERY               0x04
+#define AAP_OPCODE_EAR_DETECTION_REQUEST 0x05
+#define AAP_OPCODE_EAR_DETECTION         0x06
 #define AAP_OPCODE_CONTROL       0x09
 #define AAP_OPCODE_AUDIO_SOURCE  0x0E
 #define AAP_OPCODE_NOTIFICATIONS 0x0F
+#define AAP_OPCODE_SMART_ROUTING_RESPONSE 0x11
 #define AAP_OPCODE_HEAD_TRACKING 0x17
 #define AAP_OPCODE_METADATA      0x1D
 #define AAP_OPCODE_CA_DETECTION  0x4B
@@ -61,10 +63,12 @@
 #define AAP_EAR_IN_EAR   0x00
 #define AAP_EAR_OUT      0x01
 #define AAP_EAR_IN_CASE  0x02
+#define AAP_EAR_DISCONNECTED 0x03
 
 /* Packet sizes */
 #define AAP_HANDSHAKE_SIZE       16
 #define AAP_REQUEST_NOTIF_SIZE   10
+#define AAP_EAR_DETECTION_REQUEST_SIZE 6
 #define AAP_SET_FEATURES_SIZE    14
 #define AAP_CONTROL_CMD_SIZE     11
 #define AAP_MIN_BATTERY_SIZE     12
@@ -86,6 +90,7 @@ typedef struct {
 /* Pre-built packets */
 extern const uint8_t AAP_PKT_HANDSHAKE[AAP_HANDSHAKE_SIZE];
 extern const uint8_t AAP_PKT_REQUEST_NOTIFICATIONS[AAP_REQUEST_NOTIF_SIZE];
+extern const uint8_t AAP_PKT_REQUEST_EAR_DETECTION[AAP_EAR_DETECTION_REQUEST_SIZE];
 extern const uint8_t AAP_PKT_SET_FEATURES[AAP_SET_FEATURES_SIZE];
 
 /** Reset the per-L2CAP-session initialization state. */
@@ -128,6 +133,7 @@ typedef enum {
     AAP_PKT_TYPE_BATTERY,
     AAP_PKT_TYPE_EAR_DETECTION,
     AAP_PKT_TYPE_AUDIO_SOURCE,
+    AAP_PKT_TYPE_OWNERSHIP_RELEASE_REQUEST,
     AAP_PKT_TYPE_NOISE_CONTROL,
     AAP_PKT_TYPE_CONV_AWARENESS,
     AAP_PKT_TYPE_CA_DETECTION,
@@ -149,7 +155,6 @@ typedef struct {
 typedef struct {
     bool primary_in_ear;
     bool secondary_in_ear;
-    bool primary_left;
 } AapEarDetectionData;
 
 /* Device currently providing audio to the AirPods (TiPi AudioSource). */

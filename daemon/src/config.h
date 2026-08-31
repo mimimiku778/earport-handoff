@@ -17,6 +17,7 @@ typedef struct {
     int ear_pause_mode;   /* 0=disabled, 1=one_out, 2=both_out */
     bool handoff_enabled; /* Claim/release AudioSource based on MPRIS playback */
     bool auto_connect_on_wear; /* Connect paired AirPods after confirmed BLE wear */
+    bool disconnect_on_removal; /* Disconnect BlueZ after both wear slots stay out */
 } EarPortConfig;
 
 /**
@@ -44,12 +45,13 @@ bool config_save(const EarPortConfig *config);
 void config_get_defaults(EarPortConfig *config);
 
 /* Complete device profile (per-device settings) */
+#define DEVICE_PROFILE_DISPLAY_NAME_SIZE 64
+
 typedef struct {
-    char display_name[64];              /* Custom display name (empty = use model) */
+    char display_name[DEVICE_PROFILE_DISPLAY_NAME_SIZE]; /* Empty = use model */
     ListeningModesConfig listening_modes;
     bool conversational_awareness;      /* CA enabled */
     int adaptive_noise_level;           /* 0-100 */
-    char preferred_nc_mode[16];         /* "off", "anc", "transparency", "adaptive" */
     bool has_saved_settings;            /* Whether profile has saved settings */
 } DeviceProfile;
 
@@ -78,29 +80,10 @@ bool config_save_device_profile(const char *device_address, const DeviceProfile 
  */
 void config_get_default_profile(DeviceProfile *profile);
 
-/**
- * Load listening modes for a specific device
- *
- * @param device_address Bluetooth MAC address of the device
- * @param modes Pointer to structure to fill with listening modes
- * @return true if found and loaded, false if not found (defaults used)
- */
-bool config_load_device_listening_modes(const char *device_address, ListeningModesConfig *modes);
-
-/**
- * Save listening modes for a specific device
- *
- * @param device_address Bluetooth MAC address of the device
- * @param modes Pointer to listening modes to save
- * @return true on success
- */
-bool config_save_device_listening_modes(const char *device_address, const ListeningModesConfig *modes);
-
-/**
- * Get default listening modes
- *
- * @param modes Pointer to structure to fill with defaults
- */
-void config_get_default_listening_modes(ListeningModesConfig *modes);
+/* Copy a user-visible name into the fixed profile field without splitting a
+ * UTF-8 code point at the byte boundary. Invalid input is made valid. */
+void config_copy_display_name(
+    char destination[DEVICE_PROFILE_DISPLAY_NAME_SIZE],
+    const char *source);
 
 #endif /* CONFIG_H */

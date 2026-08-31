@@ -46,4 +46,8 @@ WearPolicyAction wear_policy_mode_change(EarPauseMode previous_mode,
                                          bool left_in_ear,
                                          bool right_in_ear);
 
+/* BlueZ removal-disconnect is deliberately independent of the media pause
+ * mode: it is eligible only when both normalized AAP wear slots are out. */
+bool wear_policy_fully_removed(bool left_in_ear, bool right_in_ear);
+
 #endif /* WEAR_POLICY_H */

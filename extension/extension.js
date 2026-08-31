@@ -90,8 +90,6 @@ class BatteryIndicator extends St.BoxLayout {
     }
 
     setHeadphonesMode(isHeadphones, deviceModel = null) {
-        this._isHeadphones = isHeadphones;
-
         if (this._type === 'left') {
             /* For headphones, left indicator becomes the unified battery */
             if (isHeadphones) {
@@ -186,7 +184,7 @@ class BatteryIndicator extends St.BoxLayout {
 /* Noise control mode button */
 const NoiseControlButton = GObject.registerClass(
 class NoiseControlButton extends St.Button {
-    _init(mode, label, gicon) {
+    _init(label, gicon) {
         super._init({
             style_class: 'earport-nc-button',
             can_focus: true,
@@ -196,8 +194,6 @@ class NoiseControlButton extends St.Button {
                 x_align: Clutter.ActorAlign.CENTER,
             }),
         });
-
-        this._mode = mode;
 
         const icon = new St.Icon({
             gicon,
@@ -213,10 +209,6 @@ class NoiseControlButton extends St.Button {
 
         this.child.add_child(icon);
         this.child.add_child(labelWidget);
-    }
-
-    get mode() {
-        return this._mode;
     }
 
     setActive(active) {
@@ -281,7 +273,7 @@ class EarPortToggle extends QuickSettings.QuickMenuToggle {
     _getNotificationSource() {
         if (this._notificationSource === null) {
             this._notificationSource = new MessageTray.Source({
-                title: 'EarPort',
+                title: this._extensionObject.metadata.name,
                 iconName: 'audio-headphones-symbolic',
             });
             /* Reset our reference if the source is destroyed externally */
@@ -343,10 +335,10 @@ class EarPortToggle extends QuickSettings.QuickMenuToggle {
         });
 
         this._ncButtons = {
-            off: new NoiseControlButton('off', _('Off'), this._modeIcons.off),
-            anc: new NoiseControlButton('anc', _('ANC'), this._modeIcons.anc),
-            transparency: new NoiseControlButton('transparency', _('Hear'), this._modeIcons.transparency),
-            adaptive: new NoiseControlButton('adaptive', _('Auto'), this._modeIcons.adaptive),
+            off: new NoiseControlButton(_('Off'), this._modeIcons.off),
+            anc: new NoiseControlButton(_('ANC'), this._modeIcons.anc),
+            transparency: new NoiseControlButton(_('Hear'), this._modeIcons.transparency),
+            adaptive: new NoiseControlButton(_('Auto'), this._modeIcons.adaptive),
         };
 
         for (const [mode, button] of Object.entries(this._ncButtons)) {
@@ -703,7 +695,7 @@ class EarPortIndicator extends QuickSettings.SystemIndicator {
 
         this._proxy = null;
         this._propertiesChangedId = 0;
-        this._extensionObject = extensionObject;
+        this._destroyed = false;
 
         /* Create toggle immediately so it's available for addExternalIndicator */
         this._toggle = new EarPortToggle(extensionObject);
@@ -720,6 +712,9 @@ class EarPortIndicator extends QuickSettings.SystemIndicator {
                 BUS_NAME,
                 OBJECT_PATH,
                 (proxy, error) => {
+                    if (this._destroyed || proxy !== this._proxy)
+                        return;
+
                     if (error) {
                         console.error('EarPort: Failed to connect to daemon:', error.message);
                         return;
@@ -803,9 +798,12 @@ class EarPortIndicator extends QuickSettings.SystemIndicator {
     }
 
     destroy() {
+        this._destroyed = true;
         if (this._proxy && this._propertiesChangedId > 0) {
             this._proxy.disconnect(this._propertiesChangedId);
         }
+        this._propertiesChangedId = 0;
+        this._proxy = null;
         this.quickSettingsItems.forEach(item => item.destroy());
         this._toggle = null;
         super.destroy();

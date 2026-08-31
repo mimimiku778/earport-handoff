@@ -27,17 +27,15 @@ void airpods_state_init(AirPodsState *state)
     state->noise_control_mode = NOISE_CONTROL_OFF;
     state->conversational_awareness = false;
     state->adaptive_noise_level = 50;
-    state->one_bud_anc_enabled = false;
 
     /* Default: Transparency and ANC enabled for long press */
     state->listening_modes.off_enabled = false;
     state->listening_modes.transparency_enabled = true;
     state->listening_modes.anc_enabled = true;
-    state->listening_modes.adaptive_enabled = true;
+    state->listening_modes.adaptive_enabled = false;
 
     state->ear_detection.left_in_ear = false;
     state->ear_detection.right_in_ear = false;
-    state->ear_detection.primary_left = true;
 }
 
 void airpods_state_cleanup(AirPodsState *state)
@@ -79,6 +77,11 @@ void airpods_state_reset(AirPodsState *state)
     state->noise_control_mode = NOISE_CONTROL_OFF;
     state->conversational_awareness = false;
     state->adaptive_noise_level = 50;
+
+    state->listening_modes.off_enabled = false;
+    state->listening_modes.transparency_enabled = true;
+    state->listening_modes.anc_enabled = true;
+    state->listening_modes.adaptive_enabled = false;
 
     state->ear_detection.left_in_ear = false;
     state->ear_detection.right_in_ear = false;
@@ -160,13 +163,11 @@ void airpods_state_set_noise_control(AirPodsState *state, NoiseControlMode mode)
 
 void airpods_state_set_ear_detection(AirPodsState *state,
                                       bool left_in_ear,
-                                      bool right_in_ear,
-                                      bool primary_left)
+                                      bool right_in_ear)
 {
     g_mutex_lock(&state->lock);
     state->ear_detection.left_in_ear = left_in_ear;
     state->ear_detection.right_in_ear = right_in_ear;
-    state->ear_detection.primary_left = primary_left;
     g_mutex_unlock(&state->lock);
 }
 

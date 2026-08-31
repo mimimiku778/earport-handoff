@@ -1,6 +1,6 @@
-# Meson build directory
-daemon/build/
+# Meson build directories (including local verification variants)
 build/
+build-*/
 
 # Editor files
 *.swp

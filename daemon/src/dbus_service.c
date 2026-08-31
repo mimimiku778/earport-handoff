@@ -82,7 +82,7 @@ struct DbusService {
     GDBusConnection *connection;
     GDBusNodeInfo *introspection_data;
     guint registration_id;
-    guint bus_name_id;
+    bool owns_name;
 
     AirPodsState *state;
 
@@ -215,6 +215,15 @@ static void handle_method_call(GDBusConnection *connection G_GNUC_UNUSED,
         gint32 level = 0;
         g_variant_get(parameters, "(i)", &level);
 
+        if (level < 0 || level > 100) {
+            g_dbus_method_invocation_return_error(
+                invocation,
+                G_DBUS_ERROR,
+                G_DBUS_ERROR_INVALID_ARGS,
+                "Adaptive noise level must be between 0 and 100");
+            return;
+        }
+
         g_message("D-Bus: SetAdaptiveNoiseLevel(%d)", level);
 
         if (service->adaptive_level_callback) {
@@ -226,6 +235,15 @@ static void handle_method_call(GDBusConnection *connection G_GNUC_UNUSED,
     } else if (g_strcmp0(method_name, "SetEarPauseMode") == 0) {
         gint32 mode = 0;
         g_variant_get(parameters, "(i)", &mode);
+
+        if (mode < 0 || mode > 2) {
+            g_dbus_method_invocation_return_error(
+                invocation,
+                G_DBUS_ERROR,
+                G_DBUS_ERROR_INVALID_ARGS,
+                "Ear pause mode must be between 0 and 2");
+            return;
+        }
 
         g_message("D-Bus: SetEarPauseMode(%d)", mode);
 
@@ -279,45 +297,32 @@ static const GDBusInterfaceVTable interface_vtable = {
     .set_property = NULL,  /* No writable properties */
 };
 
-static void on_bus_acquired(GDBusConnection *connection,
-                             const gchar *name G_GNUC_UNUSED,
-                             gpointer user_data)
+static void release_bus_name(DbusService *service)
 {
-    DbusService *service = user_data;
+    if (!service->owns_name || service->connection == NULL)
+        return;
+
     GError *error = NULL;
-
-    service->connection = g_object_ref(connection);
-
-    service->registration_id = g_dbus_connection_register_object(
-        connection,
-        DBUS_OBJECT_PATH,
-        service->introspection_data->interfaces[0],
-        &interface_vtable,
-        service,
+    GVariant *reply = g_dbus_connection_call_sync(
+        service->connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "ReleaseName",
+        g_variant_new("(s)", DBUS_SERVICE_NAME),
+        G_VARIANT_TYPE("(u)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        2000,
         NULL,
-        &error
-    );
+        &error);
 
-    if (error) {
-        g_warning("Failed to register D-Bus object: %s", error->message);
+    if (reply != NULL)
+        g_variant_unref(reply);
+    if (error != NULL) {
+        g_warning("Failed to release D-Bus name: %s", error->message);
         g_error_free(error);
-    } else {
-        g_message("D-Bus object registered at %s", DBUS_OBJECT_PATH);
     }
-}
-
-static void on_name_acquired(GDBusConnection *connection G_GNUC_UNUSED,
-                              const gchar *name,
-                              gpointer user_data G_GNUC_UNUSED)
-{
-    g_message("D-Bus name acquired: %s", name);
-}
-
-static void on_name_lost(GDBusConnection *connection G_GNUC_UNUSED,
-                          const gchar *name,
-                          gpointer user_data G_GNUC_UNUSED)
-{
-    g_warning("D-Bus name lost: %s", name);
+    service->owns_name = false;
 }
 
 DbusService *dbus_service_new(AirPodsState *state)
@@ -352,18 +357,86 @@ void dbus_service_free(DbusService *service)
 
 bool dbus_service_start(DbusService *service)
 {
-    service->bus_name_id = g_bus_own_name(
-        G_BUS_TYPE_SESSION,
-        DBUS_SERVICE_NAME,
-        G_BUS_NAME_OWNER_FLAGS_NONE,
-        on_bus_acquired,
-        on_name_acquired,
-        on_name_lost,
-        service,
-        NULL
-    );
+    enum {
+        DBUS_NAME_FLAG_DO_NOT_QUEUE = 1u << 2,
+        DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER = 1,
+        DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER = 4,
+    };
 
-    return service->bus_name_id > 0;
+    if (service == NULL || service->connection != NULL)
+        return false;
+
+    GError *error = NULL;
+    service->connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    if (service->connection == NULL) {
+        g_warning("Failed to connect to the session bus: %s",
+                  error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return false;
+    }
+
+    /* Acquire synchronously with DO_NOT_QUEUE. g_bus_own_name() reports only
+     * whether callbacks were scheduled, allowing duplicate daemons to keep
+     * running until its later name-lost callback. This bounded startup call
+     * makes singleton ownership a prerequisite for any Bluetooth work. */
+    GVariant *reply = g_dbus_connection_call_sync(
+        service->connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "RequestName",
+        g_variant_new("(su)", DBUS_SERVICE_NAME,
+                      DBUS_NAME_FLAG_DO_NOT_QUEUE),
+        G_VARIANT_TYPE("(u)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        5000,
+        NULL,
+        &error);
+
+    guint32 request_result = 0;
+    if (reply != NULL) {
+        g_variant_get(reply, "(u)", &request_result);
+        g_variant_unref(reply);
+    }
+
+    if (error != NULL ||
+        (request_result != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER &&
+         request_result != DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER)) {
+        if (error != NULL) {
+            g_warning("Failed to acquire D-Bus name: %s", error->message);
+        } else {
+            g_warning("Another EarPort daemon already owns %s",
+                      DBUS_SERVICE_NAME);
+        }
+        g_clear_error(&error);
+        g_clear_object(&service->connection);
+        return false;
+    }
+    service->owns_name = true;
+
+    service->registration_id = g_dbus_connection_register_object(
+        service->connection,
+        DBUS_OBJECT_PATH,
+        service->introspection_data->interfaces[0],
+        &interface_vtable,
+        service,
+        NULL,
+        &error);
+    if (service->registration_id == 0) {
+        g_warning("Failed to register D-Bus object: %s",
+                  error ? error->message : "unknown error");
+        g_clear_error(&error);
+        release_bus_name(service);
+        g_clear_object(&service->connection);
+        return false;
+    }
+
+    /* A restarted session bus invalidates both the name and object. Exiting
+     * lets the user service manager restart the daemon into a clean state. */
+    g_dbus_connection_set_exit_on_close(service->connection, TRUE);
+    g_message("D-Bus name acquired: %s", DBUS_SERVICE_NAME);
+    g_message("D-Bus object registered at %s", DBUS_OBJECT_PATH);
+    return true;
 }
 
 void dbus_service_stop(DbusService *service)
@@ -373,10 +446,7 @@ void dbus_service_stop(DbusService *service)
         service->registration_id = 0;
     }
 
-    if (service->bus_name_id > 0) {
-        g_bus_unown_name(service->bus_name_id);
-        service->bus_name_id = 0;
-    }
+    release_bus_name(service);
 
     if (service->connection) {
         g_object_unref(service->connection);
@@ -494,22 +564,27 @@ void dbus_service_emit_ear_detection_changed(DbusService *service,
                 g_variant_new("(bb)", left_in_ear, right_in_ear));
 }
 
-void dbus_service_emit_properties_changed(DbusService *service,
-                                           const char *property_name)
+void dbus_service_emit_properties_changed_many(
+    DbusService *service,
+    const char *const *property_names,
+    gsize property_count)
 {
     if (service->connection == NULL)
         return;
 
-    GVariant *prop_value = get_property(service->connection, NULL,
-                                         DBUS_OBJECT_PATH, DBUS_INTERFACE_NAME,
-                                         property_name, NULL, service);
-
-    if (prop_value == NULL)
-        return;
-
     GVariantBuilder builder;
     g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
-    g_variant_builder_add(&builder, "{sv}", property_name, prop_value);
+
+    for (gsize i = 0; i < property_count; i++) {
+        GVariant *prop_value = get_property(service->connection, NULL,
+                                             DBUS_OBJECT_PATH,
+                                             DBUS_INTERFACE_NAME,
+                                             property_names[i], NULL, service);
+        if (prop_value != NULL) {
+            g_variant_builder_add(&builder, "{sv}", property_names[i],
+                                  prop_value);
+        }
+    }
 
     GError *error = NULL;
     g_dbus_connection_emit_signal(
@@ -518,10 +593,10 @@ void dbus_service_emit_properties_changed(DbusService *service,
         DBUS_OBJECT_PATH,
         "org.freedesktop.DBus.Properties",
         "PropertiesChanged",
-        g_variant_new("(sa{sv}as)",
+        g_variant_new("(s@a{sv}@as)",
                       DBUS_INTERFACE_NAME,
-                      &builder,
-                      NULL),
+                      g_variant_builder_end(&builder),
+                      g_variant_new_strv(NULL, 0)),
         &error
     );
 
@@ -529,4 +604,43 @@ void dbus_service_emit_properties_changed(DbusService *service,
         g_warning("Failed to emit PropertiesChanged: %s", error->message);
         g_error_free(error);
     }
+}
+
+void dbus_service_emit_properties_changed(DbusService *service,
+                                           const char *property_name)
+{
+    dbus_service_emit_properties_changed_many(service, &property_name, 1);
+}
+
+void dbus_service_emit_all_properties_changed(DbusService *service)
+{
+    static const char *const property_names[] = {
+        "Connected",
+        "DeviceName",
+        "DeviceAddress",
+        "DeviceModel",
+        "DisplayName",
+        "IsHeadphones",
+        "SupportsANC",
+        "SupportsAdaptive",
+        "BatteryLeft",
+        "BatteryRight",
+        "BatteryCase",
+        "ChargingLeft",
+        "ChargingRight",
+        "ChargingCase",
+        "NoiseControlMode",
+        "ConversationalAwareness",
+        "LeftInEar",
+        "RightInEar",
+        "AdaptiveNoiseLevel",
+        "EarPauseMode",
+        "ListeningModeOff",
+        "ListeningModeTransparency",
+        "ListeningModeANC",
+        "ListeningModeAdaptive",
+    };
+
+    dbus_service_emit_properties_changed_many(
+        service, property_names, G_N_ELEMENTS(property_names));
 }

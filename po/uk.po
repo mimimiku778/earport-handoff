@@ -4,11 +4,11 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: earport-handoff 0.3.0\n"
+"Project-Id-Version: earport-handoff 0.4.0\n"
 "Report-Msgid-Bugs-To: https://github.com/mimimiku778/earport-handoff/issues\n"
 "POT-Creation-Date: 2026-07-08 23:02+0200\n"
 "PO-Revision-Date: 2026-07-24 10:17+0300\n"
-"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Last-Translator: EarPort Contributors <noreply@invalid>\n"
 "Language-Team: Ukrainian <uk@li.org>\n"
 "Language: uk\n"
 "MIME-Version: 1.0\n"

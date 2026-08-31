@@ -4,6 +4,7 @@
  */
 
 #include "aap_protocol.h"
+#include <glib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -15,6 +16,10 @@ const uint8_t AAP_PKT_HANDSHAKE[AAP_HANDSHAKE_SIZE] = {
 
 const uint8_t AAP_PKT_REQUEST_NOTIFICATIONS[AAP_REQUEST_NOTIF_SIZE] = {
     0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+const uint8_t AAP_PKT_REQUEST_EAR_DETECTION[AAP_EAR_DETECTION_REQUEST_SIZE] = {
+    0x04, 0x00, 0x04, 0x00, AAP_OPCODE_EAR_DETECTION_REQUEST, 0x00
 };
 
 const uint8_t AAP_PKT_SET_FEATURES[AAP_SET_FEATURES_SIZE] = {
@@ -206,6 +211,49 @@ AapParseResult aap_parse_battery(const uint8_t *data, size_t len, AapBatteryData
     return AAP_PARSE_OK;
 }
 
+static bool ear_status_is_valid(uint8_t status)
+{
+    return status == AAP_EAR_IN_EAR ||
+           status == AAP_EAR_OUT ||
+           status == AAP_EAR_IN_CASE ||
+           status == AAP_EAR_DISCONNECTED;
+}
+
+static bool bounded_bytes_contain(const uint8_t *data,
+                                  size_t len,
+                                  const uint8_t *needle,
+                                  size_t needle_len)
+{
+    if (data == NULL || needle == NULL || needle_len == 0 || len < needle_len)
+        return false;
+
+    for (size_t offset = 0; offset <= len - needle_len; offset++) {
+        if (memcmp(data + offset, needle, needle_len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static AapParseResult parse_smart_routing_response(const uint8_t *data,
+                                                   size_t len,
+                                                   AapParsedPacket *result)
+{
+    static const uint8_t release_marker[] = "SetOwnershipToFalse";
+
+    /* Smart-routing payloads contain binary/plist framing and need not be
+     * NUL-terminated. LibrePods treats this bounded marker as an explicit
+     * request from another Apple host for Linux to yield ownership. */
+    if (len < 6)
+        return AAP_PARSE_INCOMPLETE;
+
+    if (bounded_bytes_contain(data + 6, len - 6,
+                              release_marker,
+                              sizeof(release_marker) - 1)) {
+        result->type = AAP_PKT_TYPE_OWNERSHIP_RELEASE_REQUEST;
+    }
+    return AAP_PARSE_OK;
+}
+
 AapParseResult aap_parse_ear_detection(const uint8_t *data, size_t len, AapEarDetectionData *ear)
 {
     /* Packet: 04 00 04 00 06 00 [primary] [secondary] */
@@ -218,9 +266,12 @@ AapParseResult aap_parse_ear_detection(const uint8_t *data, size_t len, AapEarDe
     uint8_t primary_status = data[6];
     uint8_t secondary_status = data[7];
 
+    if (!ear_status_is_valid(primary_status) ||
+        !ear_status_is_valid(secondary_status))
+        return AAP_PARSE_MALFORMED;
+
     ear->primary_in_ear = (primary_status == AAP_EAR_IN_EAR);
     ear->secondary_in_ear = (secondary_status == AAP_EAR_IN_EAR);
-    ear->primary_left = true;  /* Default, may need to track from battery order */
 
     return AAP_PARSE_OK;
 }
@@ -274,6 +325,28 @@ AapParseResult aap_parse_noise_control(const uint8_t *data, size_t len, NoiseCon
     return AAP_PARSE_OK;
 }
 
+static bool aap_parse_metadata_string(const uint8_t *data,
+                                      size_t len,
+                                      size_t *position,
+                                      char *destination,
+                                      size_t destination_size)
+{
+    size_t output_position = 0;
+
+    while (*position < len && data[*position] != '\0') {
+        if (output_position + 1 < destination_size)
+            destination[output_position++] = (char)data[*position];
+        (*position)++;
+    }
+
+    destination[output_position] = '\0';
+    if (*position >= len)
+        return false;
+
+    (*position)++;  /* Skip the field's NUL terminator. */
+    return true;
+}
+
 static AapParseResult aap_parse_metadata(const uint8_t *data, size_t len, AapMetadata *metadata)
 {
     /* Metadata packet: 04 00 04 00 1D 00 [6 bytes] [device_name\0] [model_number\0] [manufacturer\0] */
@@ -285,31 +358,20 @@ static AapParseResult aap_parse_metadata(const uint8_t *data, size_t len, AapMet
     /* Skip header (4) + opcode (1) + 00 (1) + 6 unknown bytes = position 12 */
     size_t pos = 12;
 
-    /* Extract null-terminated strings */
-    size_t i;
-
-    /* Device name */
-    i = 0;
-    while (pos < len && data[pos] != '\0' && i < sizeof(metadata->device_name) - 1) {
-        metadata->device_name[i++] = data[pos++];
+    /* Continue consuming a field after its destination buffer fills. This
+     * preserves the boundaries of the following fields while safely
+     * truncating unusually long values. */
+    if (!aap_parse_metadata_string(data, len, &pos,
+                                   metadata->device_name,
+                                   sizeof(metadata->device_name)) ||
+        !aap_parse_metadata_string(data, len, &pos,
+                                   metadata->model_number,
+                                   sizeof(metadata->model_number)) ||
+        !aap_parse_metadata_string(data, len, &pos,
+                                   metadata->manufacturer,
+                                   sizeof(metadata->manufacturer))) {
+        return AAP_PARSE_INCOMPLETE;
     }
-    metadata->device_name[i] = '\0';
-    if (pos < len && data[pos] == '\0') pos++;  /* Skip null terminator */
-
-    /* Model number */
-    i = 0;
-    while (pos < len && data[pos] != '\0' && i < sizeof(metadata->model_number) - 1) {
-        metadata->model_number[i++] = data[pos++];
-    }
-    metadata->model_number[i] = '\0';
-    if (pos < len && data[pos] == '\0') pos++;
-
-    /* Manufacturer */
-    i = 0;
-    while (pos < len && data[pos] != '\0' && i < sizeof(metadata->manufacturer) - 1) {
-        metadata->manufacturer[i++] = data[pos++];
-    }
-    metadata->manufacturer[i] = '\0';
 
     return AAP_PARSE_OK;
 }
@@ -373,15 +435,18 @@ AapParseResult aap_parse_packet(const uint8_t *data, size_t len, AapParsedPacket
         result->type = AAP_PKT_TYPE_AUDIO_SOURCE;
         return aap_parse_audio_source(data, len, &result->data.audio_source);
 
+    case AAP_OPCODE_SMART_ROUTING_RESPONSE:
+        return parse_smart_routing_response(data, len, result);
+
     case AAP_OPCODE_CONTROL:
         return parse_control_packet(data, len, result);
 
     case AAP_OPCODE_CA_DETECTION:
         result->type = AAP_PKT_TYPE_CA_DETECTION;
         /* Packet: 04 00 04 00 4B 00 02 00 01 [level] */
-        if (len >= 10) {
-            result->data.ca_volume_level = data[9];
-        }
+        if (len < 10)
+            return AAP_PARSE_INCOMPLETE;
+        result->data.ca_volume_level = data[9];
         return AAP_PARSE_OK;
 
     case AAP_OPCODE_METADATA:
@@ -468,6 +533,12 @@ void aap_build_listening_modes_cmd(uint8_t modes, uint8_t *buffer)
 
 void aap_debug_print_packet(const char *prefix, const uint8_t *data, size_t len)
 {
+    /* Raw AAP dumps are useful while reverse-engineering, but they are far
+     * too noisy for a long-running desktop daemon.  Keep them opt-in so the
+     * normal path does no per-packet formatting or journal I/O. */
+    if (g_strcmp0(g_getenv("EARPORT_DEBUG_PACKETS"), "1") != 0)
+        return;
+
     fprintf(stderr, "%s: ", prefix);
     for (size_t i = 0; i < len && i < 64; i++) {
         fprintf(stderr, "%02X ", data[i]);

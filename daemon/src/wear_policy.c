@@ -79,3 +79,8 @@ WearPolicyAction wear_policy_mode_change(EarPauseMode previous_mode,
 
     return WEAR_POLICY_ACTION_NONE;
 }
+
+bool wear_policy_fully_removed(bool left_in_ear, bool right_in_ear)
+{
+    return !left_in_ear && !right_in_ear;
+}

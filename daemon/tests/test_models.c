@@ -50,8 +50,35 @@ static void test_handoff_default(void)
 {
     EarPortConfig config;
     config_get_defaults(&config);
+    g_assert_cmpint(config.ear_pause_mode, ==, 2);
     g_assert_true(config.handoff_enabled);
     g_assert_true(config.auto_connect_on_wear);
+    g_assert_true(config.disconnect_on_removal);
+}
+
+static void test_state_reset_clears_per_device_features(void)
+{
+    AirPodsState state;
+    airpods_state_init(&state);
+    state.ear_pause_mode = 2;
+    airpods_state_set_device(&state, "AirPods", "AA:BB:CC:DD:EE:FF",
+                             AIRPODS_MODEL_MAX_2);
+    airpods_state_set_listening_modes(&state, true, false, false, true);
+    airpods_state_set_ear_detection(&state, true, true);
+
+    airpods_state_reset(&state);
+
+    g_assert_false(state.connected);
+    g_assert_false(state.listening_modes.off_enabled);
+    g_assert_true(state.listening_modes.transparency_enabled);
+    g_assert_true(state.listening_modes.anc_enabled);
+    g_assert_false(state.listening_modes.adaptive_enabled);
+    g_assert_false(state.ear_detection.left_in_ear);
+    g_assert_false(state.ear_detection.right_in_ear);
+    /* Global preferences survive a per-device disconnect. */
+    g_assert_cmpint(state.ear_pause_mode, ==, 2);
+
+    airpods_state_cleanup(&state);
 }
 
 int main(int argc, char **argv)
@@ -60,5 +87,7 @@ int main(int argc, char **argv)
     g_test_add_func("/models/airpods-max-2", test_airpods_max_2);
     g_test_add_func("/models/airpods-4", test_airpods_4_model_numbers);
     g_test_add_func("/config/handoff-default", test_handoff_default);
+    g_test_add_func("/state/reset-clears-per-device-features",
+                    test_state_reset_clears_per_device_features);
     return g_test_run();
 }
